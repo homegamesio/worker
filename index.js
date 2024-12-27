@@ -89,7 +89,7 @@ const { MongoClient } = require('mongodb');
     
     const generateId = () => getHash(uuidv4());
     
-    const publishVersion = (versionId, data) => new Promise((resolve, reject) => {
+    const publishVersion = (squishVersion, versionId, data) => new Promise((resolve, reject) => {
         getMongoCollection(GAME_VERSION_TABLE).then(collection => {
             const gameVersion = { 
                 gameId: data.gameId, 
@@ -97,8 +97,11 @@ const { MongoClient } = require('mongodb');
                 requestId: data.requestId, 
                 publishedAt: Date.now(), 
                 publishedBy: data.userId, 
-                sourceAssetId: data.assetId 
+                sourceAssetId: data.assetId,
+                squishVersion: squishVersion || ''
             };
+            console.log("PUBLISHING THIS OPNE");
+            console.log(data);
             
             collection.insertOne(gameVersion).then(() => {
                 getMongoCollection('publishRequests').then(coll => {
@@ -155,8 +158,9 @@ const { MongoClient } = require('mongodb');
                       throw new Error("nope nope nope multiple exit messages");
                     }
                     exitMessage = ting[1];
-                    if (exitMessage === "success") {
-                      resolve();
+                    if (exitMessage.startsWith("success")) {
+                        const squishVersion = exitMessage.split('-')[1];
+                      resolve(squishVersion);
                     } else {
                       reject("Failed: " + exitMessage);
                     }
@@ -184,8 +188,8 @@ const { MongoClient } = require('mongodb');
                     console.log('dodododododo ' + filePath);
                     fs.writeFileSync(filePath, doc.data.buffer);
                     console.log('wrote to ' + filePath);
-                    poke(requestRecord, filePath).then(() => {
-                        publishVersion(requestRecord.versionId, data).then(resolve).catch(reject);
+                    poke(requestRecord, filePath).then((squishVersion) => {
+                        publishVersion(squishVersion, requestRecord.versionId, data).then(resolve).catch(reject);
                     });
                 });
             }).catch(reject);

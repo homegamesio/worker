@@ -519,36 +519,48 @@ const { MongoClient } = require('mongodb');
     
         } 
     });
+
+    const innerRun = (connection) => new Promise((resolve, reject) => {
+        connection.createChannel((channelError, channel) => {
+            if (channelError) {
+                reject(channelError);
+            } else {
+                channel.assertQueue(QUEUE_NAME, {
+                    durable: true
+                });
+                console.log('listening to messages on ' + QUEUE_NAME + ' at ' + REQUEST_QUEUE_URL);
+                channel.consume(QUEUE_NAME, (msg) => {
+                    console.log("Got message");
+                    console.log(msg);
+                    handleMessage(msg).then(() => {
+                        console.log("Handled message successfully");
+                    }).catch(err => {
+                        console.error(err);
+                    });
+                }, {
+                    noAck: true
+                });
+                resolve();
+            }
+        });
+    });
     
     const run = () => new Promise((resolve, reject) => {
-        console.log('gonna connect');
-        amqp.connect(REQUEST_QUEUE_URL, (connectionError, connection) => {
-            console.log('connected');
+        amqp.connect(REQUEST_QUEUE_URL, { 'heartbeat': 1 }, (connectionError, connection) => {
+            connection.on('error', (err) => {
+                console.error("queue error");
+                run();
+            });
+
+            connection.on('close', () => {
+                console.warn('queue connection closed');
+                run();
+            });
+
             if (connectionError) {
                 reject(connectionError);
             } else {
-                connection.createChannel((channelError, channel) => {
-                    if (channelError) {
-                        reject(channelError);
-                    } else {
-                        channel.assertQueue(QUEUE_NAME, {
-                            durable: true
-                        });
-                        console.log('listening to messages on ' + QUEUE_NAME + ' at ' + REQUEST_QUEUE_URL);
-                        channel.consume(QUEUE_NAME, (msg) => {
-                            console.log("Got message");
-                            console.log(msg);
-                            handleMessage(msg).then(() => {
-                                console.log("Handled message successfully");
-                            }).catch(err => {
-                                console.error(err);
-                            });
-                        }, {
-                            noAck: true
-                        });
-                        resolve();
-                    }
-                });
+                innerRun(connection).then(resolve).catch(reject);
             }
         });
     });
@@ -556,8 +568,8 @@ const { MongoClient } = require('mongodb');
     // forever
     setInterval(() => {
         if (!running) {
+            running = true;
             run().then(() => {
-                running = true;
             }).catch((err) => {
                 console.log(err);
                 running = false;

@@ -1,23 +1,11 @@
 const amqp = require('amqplib/callback_api');
-const crypto = require("crypto");
 const acme = require('acme-client');
-const { v4: uuidv4 } = require("uuid");
 const { MongoClient } = require('mongodb');
 
 
 (async () => {
-    //const {LlamaModel, LlamaContext, LlamaChatSession} = await import("node-llama-cpp");
-
-    //console.log(LlamaModel);
-    //const model = new LlamaModel({
-    //    modelPath: '/Users/josephgarcia/Downloads/mistral-7b-instruct-v0.2.Q4_K_M.gguf'
-    //});
-    
-    
-    const fs = require('fs');
-    const { exec } = require('child_process');
-    const http = require('http');
-    const https = require('https');
+    const path = require('path');
+    const { spawn } = require('child_process');
 
     // acme-client shares one axios instance with no default timeout, so a hung
     // TCP connection to Let's Encrypt never settles and client.auto() waits
@@ -45,21 +33,22 @@ const { MongoClient } = require('mongodb');
     // redelivery (observed as redelivered=true). 30s tolerates normal jitter.
     const HEARTBEAT_SECONDS = 30;
     
-    const PUBLISH_REQUEST = 'PUBLISH_REQUEST';
-    const CONTENT_REQUEST = 'CONTENT_REQUEST';
-    const PROFILE_IMAGE_APPROVAL_REQUEST = 'PROFILE_IMAGE_APPROVAL_REQUEST';
-    const GAME_IMAGE_APPROVAL_REQUEST = 'GAME_IMAGE_APPROVAL_REQUEST';
+    // This worker handles exactly two job types off the unified homegames-jobs
+    // queue: ACME certificate generation, and LLM "modify my game" requests.
     const CERT_REQUEST = 'CERT_REQUEST';
-    const BUILD_GAME = 'BUILD_GAME';
-    
-    const PUBLISH_REQUEST_TABLE = 'publishRequests';
-    const GAME_VERSION_TABLE = 'gameVersions';
-    
-    const FORGEJO_URL = process.env.FORGEJO_URL || 'http://52.32.110.71:3000';
-    
+    const LLM_REQUEST = 'LLM_REQUEST';
+
     let running = false;
-    
+
     const API_URL = process.env.API_URL;
+
+    // --- LLM model server -------------------------------------------------
+    // LLM generation runs in a long-lived Python child (llm/model_server.py)
+    // that keeps the MLX model warm. Node owns the queue + result-posting; the
+    // child only generates. See handleLlmRequest / ensureModelServer below.
+    const LLM_WORKER_SECRET = process.env.LLM_WORKER_SECRET || '';
+    const LLM_PYTHON = process.env.LLM_PYTHON || path.join(__dirname, 'llm', 'env', 'bin', 'python');
+    const LLM_SERVER_PATH = process.env.LLM_SERVER_PATH || path.join(__dirname, 'llm', 'model_server.py');
     
     const DB_NAME = process.env.DB_NAME;
     const DB_HOST = process.env.DB_HOST;
@@ -94,227 +83,6 @@ const { MongoClient } = require('mongodb');
         });
     });
     
-    const getPublishRequest = (requestId) => new Promise((resolve, reject) => {
-        getMongoCollection(PUBLISH_REQUEST_TABLE).then((collection) => {
-            collection.findOne({ requestId }).then(publishRequest => {
-                resolve({
-                    userId: publishRequest.userId,
-                    assetId: publishRequest.assetId,
-                    gameId: publishRequest.gameId,
-                    versionId: publishRequest.versionId,
-                    requestId: publishRequest.requestId,
-                    'status': publishRequest['status']
-                });
-            });
-        }).catch(reject);
-    });
-    
-    const getHash = (input) => {
-      return crypto.createHash("md5").update(input).digest("hex");
-    };
-    
-    const generateId = () => getHash(uuidv4());
-    
-    const publishVersion = (squishVersion, versionId, data) => new Promise((resolve, reject) => {
-        getMongoCollection(GAME_VERSION_TABLE).then(collection => {
-            const gameVersion = { 
-                gameId: data.gameId, 
-                versionId, 
-                requestId: data.requestId, 
-                publishedAt: Date.now(), 
-                publishedBy: data.userId, 
-                sourceAssetId: data.assetId,
-                squishVersion: squishVersion || ''
-            };
-            console.log("PUBLISHING THIS OPNE");
-            console.log(data);
-            
-            collection.insertOne(gameVersion).then(() => {
-                getMongoCollection('publishRequests').then(coll => {
-                    console.log("FOGOGOGOG");
-                    console.log(data.requestId);
-                    coll.updateOne({ requestId: data.requestId }, { "$set": { 'status': 'CONFIRMED'} }).catch(reject).then(resolve);
-    
-                });
-            }).catch((err) => {
-                console.error('Failed to publish new version');
-                console.error(err);
-                reject(err);
-            });
-        });
-    });
-    
-    const getMongoDocument = (assetId) => new Promise((resolve, reject) => {
-        getMongoCollection('documents').then(documents => {
-            documents.findOne({ assetId }).then(doc => {
-                if (doc) {
-                    resolve(doc);
-                } else {
-                    reject('not found');
-                }
-            });
-        });
-    });
-    
-    const poke = (requestRecord, filePath) => new Promise((resolve, reject) => {
-        console.log('need to run dockerr thing');
-        console.log(requestRecord);
-        const publishEvent = {};
-        const { exec } = require("child_process");
-        const cmd = `docker run -v ${filePath}:/thangs/test.zip --rm tang2`;
-        console.log(cmd);
-        const ting = exec(cmd, (err, stderr, stdout) => {
-            console.log('eeoeoeoe');
-            console.log(err);
-            console.log(stderr);
-            console.log(stdout);
-            const lines = stderr && stderr.split("\\n");
-            let exitMessage = null;
-            if (lines) {
-              for (line in lines) {
-                const ting = stderr.match(
-                  "AYYYYYYYYYLMAOTHISISTHEEXITMESSAGE:(.+)::andthatwastheendofthemessage",
-                );
-                if (ting) {
-                  console.log("TING!!!!");
-                  console.log(ting);
-                  if (ting[1]) {
-                    if (exitMessage) {
-                      console.error("Multiple exit messages found");
-                      throw new Error("nope nope nope multiple exit messages");
-                    }
-                    exitMessage = ting[1];
-                    if (exitMessage.startsWith("success")) {
-                        const squishVersion = exitMessage.split('-')[1];
-                      resolve(squishVersion);
-                    } else {
-                      reject("Failed: " + exitMessage);
-                    }
-                  }
-                }
-              }
-            } else {
-                reject('no output');
-            }
-        });
-    });
-    
-    const handlePublishRequest = (data) => new Promise((resolve, reject) => {
-        const { requestId, gameId, userId, assetId } = data;
-        if (!requestId || !gameId || !userId || !assetId) {
-            reject('Invalid payload: ' + data);
-        } else {
-            getPublishRequest(requestId).then(requestRecord => {
-                console.log("this is request");
-                console.log(requestRecord);
-                getMongoDocument(requestRecord.assetId).then((doc) => {
-                    console.log('got doc nee to download');
-                    console.log(doc);
-                    const filePath = '/Users/josephgarcia/homedome_data/' + Date.now() + Math.floor(Math.random()) + '.zip';
-                    console.log('dodododododo ' + filePath);
-                    fs.writeFileSync(filePath, doc.data.buffer);
-                    console.log('wrote to ' + filePath);
-                    poke(requestRecord, filePath).then((squishVersion) => {
-                        publishVersion(squishVersion, requestRecord.versionId, data).then(resolve).catch(reject);
-                    });
-                });
-            }).catch(reject);
-        }
-    });
-    
-    const handleContentRequest = (_data) => new Promise((resolve, reject) => {
-        console.log('nice cool');
-        console.log(_data);
-        const request = _data.data;
-        const req = JSON.parse(request);
-        const p = req.prompt;
-        const context = new LlamaContext({model});
-        const session = new LlamaChatSession({context});
-    
-        session.prompt(p).then((data) => {
-            console.log('got data');
-            console.log(data);
-            getMongoCollection('contentRequests').then((collection) => {
-                collection.findOne({ requestId: req.requestId }).then(found => {
-                    console.log('ayo');
-                    console.log(found);
-                    if (!found) {
-                        reject('Original request not found');
-                    } else {
-                        collection.updateOne({ requestId: req.requestId }, { "$set": { response: data } }).then(() => {
-                            console.log('heyooooo');
-                            console.log(data);
-                            resolve(data);
-                        });
-                    }
-                });
-            });
-        });
-    
-    });
-    
-    const setImage = (userId, assetId) => new Promise((resolve, reject) => {
-        getMongoCollection('users').then(users => {
-            users.findOne({ userId }).then((foundUser) => {
-                if (!foundUser) {
-                    reject('User not found');
-                } else {
-                    users.updateOne({ userId }, { "$set": { image: assetId } }).catch(reject).then(resolve);
-                }
-            });
-        });
-        console.log('gonna set image');
-    });
-    
-    const setGameImage = (userId, gameId, assetId) => new Promise((resolve, reject) => {
-        getMongoCollection('users').then(users => {
-            users.findOne({ userId }).then((foundUser) => {
-                if (!foundUser) {
-                    reject('User not found');
-                } else {
-                    getMongoCollection('games').then(games => {
-                        games.findOne({ gameId }).then((foundGame) => {
-                            if (!foundGame) {
-                                reject('Game not found');
-                            } else {
-                                games.updateOne({ gameId }, {"$set": { thumbnail: assetId }}).catch(reject).then(resolve);
-                            }
-                        });
-                    });
-                }
-            });
-        });
-    });
-    
-    const handleProfileImageApprovalRequest = (data) => new Promise((resolve, reject) => {
-        const { userId, assetId} = data;
-        downloadAsset(assetId).then(assetPath => {
-            exec(`bash run.sh ${assetPath}`, (err, stdout, stderr) => {
-                if (stdout.trim() === 'fail') {
-                    console.warn(`nsfw image - ${assetId}`);
-                    reject('NSFW');
-                } else if (stdout.trim() === 'success') {
-                    console.log(`setting profile image to ${assetId} for ${userId}`);
-                    setImage(userId, assetId);
-                }
-            });
-        });
-    });
-    
-    const handleGameImageApprovalRequest = (data) => new Promise((resolve, reject) => {
-        const { userId, gameId, assetId} = data;
-        downloadAsset(assetId).then(assetPath => {
-            exec(`bash run.sh ${assetPath}`, (err, stdout, stderr) => {
-                if (stdout.trim() === 'fail') {
-                    console.warn(`nsfw image - ${assetId}`);
-                    reject('NSFW');
-                } else if (stdout.trim() === 'success') {
-                    console.log(`setting game ${gameId} image to ${assetId} for ${userId}`);
-                    setGameImage(userId, gameId, assetId);
-                }
-            });
-        });
-    });
     
     const challengeCreateFn = async(authz, challenge, keyAuthorization) => {
         if (challenge.type === 'dns-01') {
@@ -532,191 +300,171 @@ const { MongoClient } = require('mongodb');
         }).catch(reject);
     });
     
-    const downloadAsset = (assetId) => new Promise((resolve, reject) => {
-        const outPath = '/Users/josephgarcia/nsfw_model/assets/' + assetId;
-        const writeStream = fs.createWriteStream(outPath);
-    
-        writeStream.on('close', () => {
-            resolve(outPath);
-        });
-    
-        https.get(`${API_URL}/assets/${assetId}`, (res) => {//assets.homegames.io/${assetId}`, (res) => {
-            console.log('downloaded');
-            res.pipe(writeStream);
-        });
-    });
-    
+
     // ---------------------------------------------------------------------------
-    // BUILD_GAME handler (Forgejo-based pipeline)
+    // LLM model server (persistent Python child)
     // ---------------------------------------------------------------------------
+    // One long-lived child (llm/model_server.py) holds the warm MLX model. We
+    // talk to it over newline-delimited JSON: write one job per line to stdin,
+    // read one result per line from stdout. The child's stderr is its logging.
 
-    const updateBuildStatus = (buildId, status, error) => new Promise((resolve, reject) => {
-        getMongoCollection('builds').then(collection => {
-            const update = { '$set': { status, completed: Date.now() } };
-            if (error) {
-                update['$set'].error = error;
-            }
-            collection.updateOne({ buildId }, update).then(resolve).catch(reject);
-        }).catch(reject);
-    });
+    let llmChild = null;            // current child process, or null if not running
+    let llmReady = false;           // true once it emits {"ready":true}
+    let llmStdoutBuf = '';          // partial-line buffer for child stdout
+    const llmPending = new Map();   // job id -> { resolve, reject }
+    const llmReadyWaiters = [];     // resolvers waiting for the child to become ready
 
-    const publishGameVersion = (data) => new Promise((resolve, reject) => {
-        const versionId = generateId();
-        const gameVersion = {
-            gameId: data.gameId,
-            versionId,
-            commitSha: data.commitSha,
-            publishedAt: Date.now(),
-            publishedBy: data.userId,
-            forgejoRepo: data.forgejoRepo,
-        };
+    const rejectAllPending = (err) => {
+        for (const { reject } of llmPending.values()) {
+            reject(err);
+        }
+        llmPending.clear();
+    };
 
-        getMongoCollection(GAME_VERSION_TABLE).then(collection => {
-            collection.insertOne(gameVersion).then(() => {
-                console.log(`Published game version ${versionId} for ${data.gameId}`);
-                resolve(versionId);
-            }).catch(reject);
-        }).catch(reject);
-    });
-
-    const updateElasticsearch = (gameId) => new Promise((resolve, reject) => {
-        getMongoCollection('games').then(collection => {
-            collection.findOne({ gameId }).then(game => {
-                if (!game) {
-                    resolve();
-                    return;
-                }
-
-                const body = JSON.stringify({
-                    gameId: game.gameId,
-                    name: game.name,
-                    description: game.description || '',
-                    developerId: game.developerId,
-                    created: game.created,
-                    thumbnail: game.thumbnail,
-                    featured: game.featured || false,
-                });
-
-                const { ELASTICSEARCH_HOST, ELASTICSEARCH_PORT } = process.env;
-                if (!ELASTICSEARCH_HOST) {
-                    console.log('No ELASTICSEARCH_HOST configured, skipping index update');
-                    resolve();
-                    return;
-                }
-
-                const options = {
-                    hostname: ELASTICSEARCH_HOST,
-                    port: ELASTICSEARCH_PORT || 9200,
-                    path: `/games/_doc/${gameId}`,
-                    method: 'POST',
-                    headers: {
-                        'Content-Type': 'application/json',
-                        'Content-Length': Buffer.byteLength(body),
-                    },
-                };
-
-                const req = http.request(options, (res) => {
-                    let data = '';
-                    res.on('data', (chunk) => { data += chunk; });
-                    res.on('end', () => { resolve(); });
-                });
-                req.on('error', (e) => {
-                    console.error('Elasticsearch update failed', e.message);
-                    resolve(); // Don't fail the build over search indexing
-                });
-                req.write(body);
-                req.end();
-            }).catch(reject);
-        }).catch(reject);
-    });
-
-    const handleBuildGame = (data) => new Promise((resolve, reject) => {
-        const { buildId, gameId, forgejoRepo, commitSha, userId } = data;
-
-        if (!buildId || !gameId || !forgejoRepo || !commitSha) {
-            const errMsg = 'Invalid BUILD_GAME payload: missing required fields';
-            console.error(errMsg, data);
-            reject(errMsg);
+    const handleLlmLine = (line) => {
+        let msg;
+        try {
+            msg = JSON.parse(line);
+        } catch (e) {
+            console.error('[llm] non-JSON line on stdout: ' + line);
             return;
         }
+        if (msg.ready) {
+            llmReady = true;
+            console.log('[llm] model server ready');
+            while (llmReadyWaiters.length) llmReadyWaiters.shift()();
+            return;
+        }
+        const pending = msg.id != null ? llmPending.get(msg.id) : null;
+        if (!pending) {
+            console.error('[llm] result for unknown/expired id ' + msg.id);
+            return;
+        }
+        llmPending.delete(msg.id);
+        pending.resolve(msg);
+    };
 
-        console.log(`[BUILD_GAME] Starting build ${buildId} for ${forgejoRepo}@${commitSha.substring(0, 7)}`);
+    const spawnModelServer = () => {
+        console.log('[llm] spawning model server: ' + LLM_PYTHON + ' ' + LLM_SERVER_PATH);
+        llmReady = false;
+        llmStdoutBuf = '';
+        const child = spawn(LLM_PYTHON, [LLM_SERVER_PATH], { stdio: ['pipe', 'pipe', 'pipe'] });
 
-        // TODO: Replace this with real Docker sandbox check.
-        // For now, we fake a successful build after a short delay to simulate
-        // the Docker container running and passing.
-        //
-        // When real: clone repo from Forgejo, zip it, run through tang2 Docker
-        // container, parse exit message for success/failure.
-        //
-        // Real implementation would look like:
-        //   1. git clone ${FORGEJO_URL}/${forgejoRepo}.git --branch main --single-branch /tmp/build-${buildId}
-        //   2. cd /tmp/build-${buildId} && git checkout ${commitSha}
-        //   3. zip -r /tmp/build-${buildId}.zip /tmp/build-${buildId}/
-        //   4. docker run -v /tmp/build-${buildId}.zip:/thangs/test.zip --rm tang2
-        //   5. Parse stderr for AYYYYYYYYYLMAOTHISISTHEEXITMESSAGE
+        // stdout is the protocol channel: newline-delimited JSON only.
+        child.stdout.setEncoding('utf8');
+        child.stdout.on('data', (chunk) => {
+            llmStdoutBuf += chunk;
+            let nl;
+            while ((nl = llmStdoutBuf.indexOf('\n')) >= 0) {
+                const line = llmStdoutBuf.slice(0, nl).trim();
+                llmStdoutBuf = llmStdoutBuf.slice(nl + 1);
+                if (line) handleLlmLine(line);
+            }
+        });
 
-        const FAKE_BUILD_DELAY_MS = 2000;
+        // stderr is the child's human-readable logging; surface it tagged.
+        child.stderr.setEncoding('utf8');
+        child.stderr.on('data', (chunk) => {
+            process.stderr.write('[llm] ' + chunk);
+        });
 
-        setTimeout(() => {
-            const buildPassed = true; // Fake: always passes
+        const onGone = (info) => {
+            if (llmChild !== child) return; // already replaced by a restart
+            console.error('[llm] model server gone (' + info + ')');
+            llmChild = null;
+            llmReady = false;
+            rejectAllPending(new Error('LLM model server exited (' + info + ')'));
+        };
+        child.on('exit', (code, signal) => onGone('code=' + code + ' signal=' + signal));
+        child.on('error', (err) => onGone('spawn error: ' + err.message));
 
-            if (buildPassed) {
-                console.log(`[BUILD_GAME] Build ${buildId} passed sandbox check`);
+        llmChild = child;
+    };
 
-                publishGameVersion(data).then(versionId => {
-                    updateBuildStatus(buildId, 'PUBLISHED', null).then(() => {
-                        console.log(`[BUILD_GAME] Build ${buildId} published as version ${versionId}`);
+    // Ensure the child is running and ready; resolves once {"ready":true} seen.
+    const ensureModelServer = () => new Promise((resolve, reject) => {
+        if (!llmChild) {
+            try {
+                spawnModelServer();
+            } catch (err) {
+                reject(err);
+                return;
+            }
+        }
+        if (llmReady) {
+            resolve();
+        } else {
+            llmReadyWaiters.push(resolve);
+        }
+    });
 
-                        updateElasticsearch(gameId).then(() => {
-                            resolve();
-                        }).catch(err => {
-                            console.error('[BUILD_GAME] Elasticsearch update failed (non-fatal)', err);
-                            resolve(); // Build still succeeded
-                        });
-                    }).catch(err => {
-                        console.error(`[BUILD_GAME] Failed to update build status for ${buildId}`, err);
-                        reject(err);
-                    });
-                }).catch(err => {
-                    console.error(`[BUILD_GAME] Failed to publish game version for ${buildId}`, err);
-                    updateBuildStatus(buildId, 'FAILED', 'Failed to create game version: ' + (err.toString ? err.toString() : err))
-                        .then(() => reject(err))
-                        .catch(() => reject(err));
-                });
-            } else {
-                // This path would be hit when the Docker sandbox rejects the code
-                const errorMessage = 'Sandbox validation failed';
-                console.log(`[BUILD_GAME] Build ${buildId} failed: ${errorMessage}`);
+    // Kill the current child (e.g. after a stuck job) so the next job respawns it.
+    const restartModelServer = () => {
+        if (llmChild) {
+            const dying = llmChild;
+            llmChild = null;
+            llmReady = false;
+            try { dying.kill('SIGKILL'); } catch (e) { /* already dead */ }
+        }
+        rejectAllPending(new Error('LLM model server restarted'));
+    };
 
-                updateBuildStatus(buildId, 'FAILED', errorMessage).then(() => {
-                    resolve(); // Message handled successfully even though build failed
-                }).catch(err => {
-                    console.error(`[BUILD_GAME] Failed to update build status for ${buildId}`, err);
-                    reject(err);
+    // Send one job to the model server, resolve with its result line.
+    const runLlmJob = (job) => ensureModelServer().then(() => new Promise((resolve, reject) => {
+        if (llmPending.has(job.id)) {
+            reject(new Error('Duplicate in-flight LLM job id ' + job.id));
+            return;
+        }
+        llmPending.set(job.id, { resolve, reject });
+        llmChild.stdin.write(JSON.stringify(job) + '\n');
+    }));
+
+    // POST the model server's result to the API. result = {id, status, result?, error?}.
+    const postLlmResult = (requestId, result) => {
+        const payload = { requestId, status: result.status };
+        if (result.result != null) payload.result = result.result;
+        if (result.error != null) payload.error = result.error;
+        return fetch(`${API_URL}/internal/llm-result`, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'Authorization': `Bearer ${LLM_WORKER_SECRET}`
+            },
+            body: JSON.stringify(payload)
+        }).then((resp) => {
+            if (!resp.ok) {
+                return resp.text().then((text) => {
+                    throw new Error(`/internal/llm-result returned ${resp.status}: ${text.slice(0, 200)}`);
                 });
             }
-        }, FAKE_BUILD_DELAY_MS);
+            console.log(`[llm] posted ${result.status} for ${requestId}`);
+        });
+    };
+
+    const handleLlmRequest = (data) => new Promise((resolve, reject) => {
+        const job = { id: data.requestId, source: data.source, prompt: data.prompt };
+        // 10 min backstop: covers a cold child's model load plus generation.
+        withTimeout(runLlmJob(job), 10 * 60 * 1000, 'LLM model server').then(
+            (result) => {
+                // Generation succeeded (server still warm); relay to the API.
+                postLlmResult(data.requestId, result).then(resolve).catch(reject);
+            },
+            (err) => {
+                // Generation failed (timeout or child died) — the server may be
+                // wedged, so restart it for the next job, then fail this one.
+                console.error('[llm] generation failed for ' + data.requestId + ': ' + (err && err.message));
+                restartModelServer();
+                reject(err);
+            }
+        );
     });
 
     const messageHandlers = {
-        [PUBLISH_REQUEST]: {
-            handle: handlePublishRequest
-        },
-        [CONTENT_REQUEST]: {
-            handle: handleContentRequest
-        },
-        [PROFILE_IMAGE_APPROVAL_REQUEST]: {
-            handle: handleProfileImageApprovalRequest
-        },
-        [GAME_IMAGE_APPROVAL_REQUEST]: {
-            handle: handleGameImageApprovalRequest
-        },
         [CERT_REQUEST]: {
             handle: handleCertRequest
         },
-        [BUILD_GAME]: {
-            handle: handleBuildGame
+        [LLM_REQUEST]: {
+            handle: handleLlmRequest
         }
     };
     
@@ -925,6 +673,17 @@ const { MongoClient } = require('mongodb');
         });
         return;
     }
+
+    // Don't leave the Python model server orphaned when the worker stops.
+    const shutdown = (signal) => {
+        console.log('received ' + signal + ', shutting down');
+        if (llmChild) {
+            try { llmChild.kill('SIGTERM'); } catch (e) { /* already dead */ }
+        }
+        process.exit(0);
+    };
+    process.on('SIGINT', () => shutdown('SIGINT'));
+    process.on('SIGTERM', () => shutdown('SIGTERM'));
 
     // forever
     setInterval(() => {

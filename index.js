@@ -6,30 +6,56 @@ const { MongoClient } = require('mongodb');
 
 
 (async () => {
-    const {LlamaModel, LlamaContext, LlamaChatSession} = await import("node-llama-cpp");
+    //const {LlamaModel, LlamaContext, LlamaChatSession} = await import("node-llama-cpp");
 
-    console.log(LlamaModel);
-    const model = new LlamaModel({
-        modelPath: '/Users/josephgarcia/Downloads/mistral-7b-instruct-v0.2.Q4_K_M.gguf'
-    });
+    //console.log(LlamaModel);
+    //const model = new LlamaModel({
+    //    modelPath: '/Users/josephgarcia/Downloads/mistral-7b-instruct-v0.2.Q4_K_M.gguf'
+    //});
     
     
     const fs = require('fs');
     const { exec } = require('child_process');
     const http = require('http');
     const https = require('https');
+
+    // acme-client shares one axios instance with no default timeout, so a hung
+    // TCP connection to Let's Encrypt never settles and client.auto() waits
+    // forever (the cert job stalls right after logging the CSR). Give every ACME
+    // HTTP request a hard timeout so a stuck connection rejects instead of hanging.
+    acme.axios.defaults.timeout = 30000;
+
+    // Reject a promise if it hasn't settled within ms. Used as a backstop around
+    // the whole ACME flow (account reg + order + dns-01 validation + finalize),
+    // since the per-request timeout above only covers individual HTTP calls.
+    const withTimeout = (promise, ms, label) => Promise.race([
+        promise,
+        new Promise((_, reject) => setTimeout(() => reject(new Error((label || 'operation') + ' timed out after ' + ms + 'ms')), ms))
+    ]);
     
-    const REQUEST_QUEUE_URL = process.env.QUEUE_URL;
-    const QUEUE_NAME = process.env.QUEUE_NAME;
+    // frameMax=0 keeps the broker's offered frame size (131072). amqplib otherwise
+    // shrinks it to its 4096 default, which this broker rejects mid-handshake with
+    // an ECONNRESET right after Connection.Open (pika never shrinks it, so it works).
+    const REQUEST_QUEUE_URL = 'amqp://api.homegames.io:5672?frameMax=0';//52.32.110.71';//process.env.QUEUE_URL;
+    const QUEUE_NAME = 'homegames-jobs';//process.env.QUEUE_NAME;
+
+    // Heartbeat interval (seconds). The old value of 1 was pathological: cert jobs
+    // run for minutes and any ~2s event-loop stall made the broker declare the
+    // connection dead, drop it mid-job, and requeue the unacked message for
+    // redelivery (observed as redelivered=true). 30s tolerates normal jitter.
+    const HEARTBEAT_SECONDS = 30;
     
     const PUBLISH_REQUEST = 'PUBLISH_REQUEST';
     const CONTENT_REQUEST = 'CONTENT_REQUEST';
     const PROFILE_IMAGE_APPROVAL_REQUEST = 'PROFILE_IMAGE_APPROVAL_REQUEST';
     const GAME_IMAGE_APPROVAL_REQUEST = 'GAME_IMAGE_APPROVAL_REQUEST';
     const CERT_REQUEST = 'CERT_REQUEST';
+    const BUILD_GAME = 'BUILD_GAME';
     
     const PUBLISH_REQUEST_TABLE = 'publishRequests';
     const GAME_VERSION_TABLE = 'gameVersions';
+    
+    const FORGEJO_URL = process.env.FORGEJO_URL || 'http://52.32.110.71:3000';
     
     let running = false;
     
@@ -337,15 +363,19 @@ const { MongoClient } = require('mongodb');
                     Id: data.ChangeInfo.Id
                 };
     
-                route53.waitFor('resourceRecordSetsChanged', params, (err, data) => {
-                    if (data.ChangeInfo.Status === 'INSYNC') {
+                route53.waitFor('resourceRecordSetsChanged', params, (waitErr, waitData) => {
+                    if (waitErr) {
+                        reject(waitErr);
+                    } else if (waitData && waitData.ChangeInfo && waitData.ChangeInfo.Status === 'INSYNC') {
                         resolve();
+                    } else {
+                        reject(new Error('Route53 CREATE did not reach INSYNC: ' + JSON.stringify(waitData && waitData.ChangeInfo)));
                     }
                 });
             }
         });
     });
-    
+
     const deleteDnsRecord = (name) => new Promise((resolve, reject) => {
     
         getDnsRecord(name).then((value) => {
@@ -375,16 +405,24 @@ const { MongoClient } = require('mongodb');
             route53.changeResourceRecordSets(deleteDnsParams, (err, data) => {
                 console.log(err);
                 console.log(data);
+                if (err) {
+                    reject(err);
+                    return;
+                }
                 const deleteParams = {
                     Id: data.ChangeInfo.Id
                 };
-    
-                route53.waitFor('resourceRecordSetsChanged', deleteParams, (err, data) => {
-                    if (data.ChangeInfo.Status === 'INSYNC') {
+
+                route53.waitFor('resourceRecordSetsChanged', deleteParams, (waitErr, waitData) => {
+                    if (waitErr) {
+                        reject(waitErr);
+                    } else if (waitData && waitData.ChangeInfo && waitData.ChangeInfo.Status === 'INSYNC') {
                         resolve();
+                    } else {
+                        reject(new Error('Route53 DELETE did not reach INSYNC: ' + JSON.stringify(waitData && waitData.ChangeInfo)));
                     }
                 });
-    
+
             });
         }).catch(err => {
             console.error('Error');
@@ -429,39 +467,69 @@ const { MongoClient } = require('mongodb');
                 cert
             }).then(() => {
                 console.log('auyoao');
-            });
-        });
+                // Must settle the promise: handleCertRequest chains .then(resolve)
+                // on this, so without it a SUCCESSFUL issuance never acks and the
+                // job gets redelivered.
+                resolve();
+            }).catch(reject);
+        }).catch(reject);
     });
-    
+
+    // Look up an existing, not-yet-expired cert for this IP. Makes CERT_REQUEST
+    // idempotent: a redelivered or double-submitted job reuses the stored cert
+    // instead of issuing a fresh one (which would trip Let's Encrypt production's
+    // rate limit).
+    const getValidCert = (ip) => new Promise((resolve, reject) => {
+        getMongoCollection('certs').then((collection) => {
+            collection.findOne({ ip, expiresAt: { $gt: Date.now() } }).then(resolve).catch(reject);
+        }).catch(reject);
+    });
+
     const handleCertRequest = (data) => new Promise((resolve, reject) => {
         console.log('yoooo');
         console.log(data);
-        const key = data.key.data;
-        const client = new acme.Client({
-            directoryUrl: acme.directory.letsencrypt.production,//.staging
-            accountKey: key
-        });
-    
-        console.log('did this !!');
-        const csr = data.cert.data;
-        console.log('this is csr ' + csr);
-        const autoOpts = {
-            csr,
-            email: 'joseph@homegames.io',
-            termsOfServiceAgreed: true,
-            challengeCreateFn,//: async (authz, challenge, keyAuthorization) => {},
-            challengeRemoveFn,//: async (authz, challenge, keyAuthorization) => {},
-            challengePriority: ['dns-01']
-        };
-    
-        client.auto(autoOpts).then(certificate => {
-            console.log('certificate!');
-            console.log(certificate);
-            insertCertRecord(data.ip, Buffer.from(certificate).toString('base64')).then(resolve);
-        }).catch(err => {
-            console.error('error creating certificate');
-            console.error(err);
-        });
+
+        getValidCert(data.ip).then((existing) => {
+            if (existing) {
+                // Already have a live cert for this IP — don't re-issue.
+                console.log(`[job] cert already valid for ip=${data.ip} (expiresAt=${existing.expiresAt}) -> skipping issuance`);
+                resolve();
+                return;
+            }
+
+            const key = data.key.data;
+            const client = new acme.Client({
+                directoryUrl: acme.directory.letsencrypt.staging,
+                accountKey: key
+            });
+
+            console.log('did this !!');
+            const csr = data.cert.data;
+            console.log('this is csr ' + csr);
+            const autoOpts = {
+                csr,
+                email: 'joseph@homegames.io',
+                termsOfServiceAgreed: true,
+                challengeCreateFn,//: async (authz, challenge, keyAuthorization) => {},
+                challengeRemoveFn,//: async (authz, challenge, keyAuthorization) => {},
+                challengePriority: ['dns-01']
+            };
+
+            // 5 min backstop: dns-01 propagation + LE validation can legitimately take
+            // a couple minutes, but anything past this is a stuck flow, not slow DNS.
+            withTimeout(client.auto(autoOpts), 5 * 60 * 1000, 'ACME client.auto').then(certificate => {
+                console.log('certificate!');
+                console.log(certificate);
+                // Reject if the store fails, so a freshly-issued (rate-limited!) cert
+                // that can't be persisted surfaces as a failure instead of hanging.
+                insertCertRecord(data.ip, Buffer.from(certificate).toString('base64')).then(resolve).catch(reject);
+            }).catch(err => {
+                console.error('error creating certificate');
+                console.error(err);
+                // Propagate so the consumer can ack-and-drop instead of hanging silently.
+                reject(err);
+            });
+        }).catch(reject);
     });
     
     const downloadAsset = (assetId) => new Promise((resolve, reject) => {
@@ -478,6 +546,159 @@ const { MongoClient } = require('mongodb');
         });
     });
     
+    // ---------------------------------------------------------------------------
+    // BUILD_GAME handler (Forgejo-based pipeline)
+    // ---------------------------------------------------------------------------
+
+    const updateBuildStatus = (buildId, status, error) => new Promise((resolve, reject) => {
+        getMongoCollection('builds').then(collection => {
+            const update = { '$set': { status, completed: Date.now() } };
+            if (error) {
+                update['$set'].error = error;
+            }
+            collection.updateOne({ buildId }, update).then(resolve).catch(reject);
+        }).catch(reject);
+    });
+
+    const publishGameVersion = (data) => new Promise((resolve, reject) => {
+        const versionId = generateId();
+        const gameVersion = {
+            gameId: data.gameId,
+            versionId,
+            commitSha: data.commitSha,
+            publishedAt: Date.now(),
+            publishedBy: data.userId,
+            forgejoRepo: data.forgejoRepo,
+        };
+
+        getMongoCollection(GAME_VERSION_TABLE).then(collection => {
+            collection.insertOne(gameVersion).then(() => {
+                console.log(`Published game version ${versionId} for ${data.gameId}`);
+                resolve(versionId);
+            }).catch(reject);
+        }).catch(reject);
+    });
+
+    const updateElasticsearch = (gameId) => new Promise((resolve, reject) => {
+        getMongoCollection('games').then(collection => {
+            collection.findOne({ gameId }).then(game => {
+                if (!game) {
+                    resolve();
+                    return;
+                }
+
+                const body = JSON.stringify({
+                    gameId: game.gameId,
+                    name: game.name,
+                    description: game.description || '',
+                    developerId: game.developerId,
+                    created: game.created,
+                    thumbnail: game.thumbnail,
+                    featured: game.featured || false,
+                });
+
+                const { ELASTICSEARCH_HOST, ELASTICSEARCH_PORT } = process.env;
+                if (!ELASTICSEARCH_HOST) {
+                    console.log('No ELASTICSEARCH_HOST configured, skipping index update');
+                    resolve();
+                    return;
+                }
+
+                const options = {
+                    hostname: ELASTICSEARCH_HOST,
+                    port: ELASTICSEARCH_PORT || 9200,
+                    path: `/games/_doc/${gameId}`,
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'Content-Length': Buffer.byteLength(body),
+                    },
+                };
+
+                const req = http.request(options, (res) => {
+                    let data = '';
+                    res.on('data', (chunk) => { data += chunk; });
+                    res.on('end', () => { resolve(); });
+                });
+                req.on('error', (e) => {
+                    console.error('Elasticsearch update failed', e.message);
+                    resolve(); // Don't fail the build over search indexing
+                });
+                req.write(body);
+                req.end();
+            }).catch(reject);
+        }).catch(reject);
+    });
+
+    const handleBuildGame = (data) => new Promise((resolve, reject) => {
+        const { buildId, gameId, forgejoRepo, commitSha, userId } = data;
+
+        if (!buildId || !gameId || !forgejoRepo || !commitSha) {
+            const errMsg = 'Invalid BUILD_GAME payload: missing required fields';
+            console.error(errMsg, data);
+            reject(errMsg);
+            return;
+        }
+
+        console.log(`[BUILD_GAME] Starting build ${buildId} for ${forgejoRepo}@${commitSha.substring(0, 7)}`);
+
+        // TODO: Replace this with real Docker sandbox check.
+        // For now, we fake a successful build after a short delay to simulate
+        // the Docker container running and passing.
+        //
+        // When real: clone repo from Forgejo, zip it, run through tang2 Docker
+        // container, parse exit message for success/failure.
+        //
+        // Real implementation would look like:
+        //   1. git clone ${FORGEJO_URL}/${forgejoRepo}.git --branch main --single-branch /tmp/build-${buildId}
+        //   2. cd /tmp/build-${buildId} && git checkout ${commitSha}
+        //   3. zip -r /tmp/build-${buildId}.zip /tmp/build-${buildId}/
+        //   4. docker run -v /tmp/build-${buildId}.zip:/thangs/test.zip --rm tang2
+        //   5. Parse stderr for AYYYYYYYYYLMAOTHISISTHEEXITMESSAGE
+
+        const FAKE_BUILD_DELAY_MS = 2000;
+
+        setTimeout(() => {
+            const buildPassed = true; // Fake: always passes
+
+            if (buildPassed) {
+                console.log(`[BUILD_GAME] Build ${buildId} passed sandbox check`);
+
+                publishGameVersion(data).then(versionId => {
+                    updateBuildStatus(buildId, 'PUBLISHED', null).then(() => {
+                        console.log(`[BUILD_GAME] Build ${buildId} published as version ${versionId}`);
+
+                        updateElasticsearch(gameId).then(() => {
+                            resolve();
+                        }).catch(err => {
+                            console.error('[BUILD_GAME] Elasticsearch update failed (non-fatal)', err);
+                            resolve(); // Build still succeeded
+                        });
+                    }).catch(err => {
+                        console.error(`[BUILD_GAME] Failed to update build status for ${buildId}`, err);
+                        reject(err);
+                    });
+                }).catch(err => {
+                    console.error(`[BUILD_GAME] Failed to publish game version for ${buildId}`, err);
+                    updateBuildStatus(buildId, 'FAILED', 'Failed to create game version: ' + (err.toString ? err.toString() : err))
+                        .then(() => reject(err))
+                        .catch(() => reject(err));
+                });
+            } else {
+                // This path would be hit when the Docker sandbox rejects the code
+                const errorMessage = 'Sandbox validation failed';
+                console.log(`[BUILD_GAME] Build ${buildId} failed: ${errorMessage}`);
+
+                updateBuildStatus(buildId, 'FAILED', errorMessage).then(() => {
+                    resolve(); // Message handled successfully even though build failed
+                }).catch(err => {
+                    console.error(`[BUILD_GAME] Failed to update build status for ${buildId}`, err);
+                    reject(err);
+                });
+            }
+        }, FAKE_BUILD_DELAY_MS);
+    });
+
     const messageHandlers = {
         [PUBLISH_REQUEST]: {
             handle: handlePublishRequest
@@ -493,6 +714,9 @@ const { MongoClient } = require('mongodb');
         },
         [CERT_REQUEST]: {
             handle: handleCertRequest
+        },
+        [BUILD_GAME]: {
+            handle: handleBuildGame
         }
     };
     
@@ -528,43 +752,180 @@ const { MongoClient } = require('mongodb');
                 channel.assertQueue(QUEUE_NAME, {
                     durable: true
                 });
+                // One unacked message at a time. Without this the broker pushes the
+                // entire backlog to a single consumer at once; cert jobs run for
+                // minutes, so a connection flap would strand (and later redeliver)
+                // every in-flight job instead of just one.
+                channel.prefetch(1);
                 console.log('listening to messages on ' + QUEUE_NAME + ' at ' + REQUEST_QUEUE_URL);
                 channel.consume(QUEUE_NAME, (msg) => {
-                    console.log("Got message");
-                    console.log(msg);
+                    // null msg means the consumer was cancelled by the broker.
+                    if (!msg) return;
+
+                    // Greppable per-delivery summary (grep '[job]') so duplicate
+                    // processing is easy to spot. The distinction that matters:
+                    //   redelivered=false  -> the broker handed us this delivery for
+                    //                         the first time. Two such lines with the
+                    //                         SAME ip but DIFFERENT deliveryTags means
+                    //                         the job was ENQUEUED twice (producer side).
+                    //   redelivered=true   -> the broker is RE-pushing a message we
+                    //                         never acked (connection dropped mid-job,
+                    //                         or we acked on a dead channel). Same job,
+                    //                         reprocessed. This is a consumer-side bug,
+                    //                         not a double submit.
+                    // consumerTag tells you WHICH consumer got it — if you see more
+                    // than one distinct consumerTag live at once, the reconnect logic
+                    // has spawned overlapping consumers (see queue-stats).
+                    let summary = {};
+                    try {
+                        const parsed = JSON.parse(msg.content);
+                        summary = { type: parsed.type, ip: parsed.ip };
+                    } catch (e) { /* parse error surfaced by handleMessage below */ }
+                    console.log(`[job] recv type=${summary.type} ip=${summary.ip} redelivered=${msg.fields.redelivered} deliveryTag=${msg.fields.deliveryTag} consumerTag=${msg.fields.consumerTag} messageId=${msg.properties.messageId}`);
+
                     handleMessage(msg).then(() => {
-                        console.log("Handled message successfully");
+                        console.log(`[job] done type=${summary.type} ip=${summary.ip} deliveryTag=${msg.fields.deliveryTag} -> ack`);
+                        // Ack on success so it's removed from the queue. NOTE: if the
+                        // channel that delivered this msg has since closed (reconnect),
+                        // this ack throws / no-ops and the broker will redeliver.
+                        channel.ack(msg);
                     }).catch(err => {
+                        console.error(`[job] fail type=${summary.type} ip=${summary.ip} deliveryTag=${msg.fields.deliveryTag} -> ack(drop)`);
                         console.error(err);
+                        // Application-level failure: ack to DROP (do NOT requeue).
+                        // Auto-retrying a failed ACME order would hammer Let's Encrypt's
+                        // rate limit; the user can re-request to enqueue a fresh job.
+                        // A worker CRASH (no ack at all) still triggers redelivery.
+                        channel.ack(msg);
                     });
                 }, {
-                    noAck: true
+                    // Manual ack: a crash before ack redelivers the job (crash-safety),
+                    // which noAck:true did not provide.
+                    noAck: false
                 });
                 resolve();
             }
         });
     });
     
+    // Purge every message currently sitting in the queue. Opens its own
+    // short-lived connection/channel so it can be called independently of the
+    // long-running consumer (e.g. from the CLI). Resolves with the number of
+    // messages that were removed.
+    const clearQueue = () => new Promise((resolve, reject) => {
+        amqp.connect(REQUEST_QUEUE_URL, { 'heartbeat': HEARTBEAT_SECONDS }, (connectionError, connection) => {
+            if (connectionError) {
+                reject(connectionError);
+                return;
+            }
+            connection.createChannel((channelError, channel) => {
+                if (channelError) {
+                    connection.close();
+                    reject(channelError);
+                    return;
+                }
+                // assertQueue first so purge doesn't fail if the queue is absent,
+                // and to match the durable settings the consumer declares.
+                channel.assertQueue(QUEUE_NAME, { durable: true });
+                channel.purgeQueue(QUEUE_NAME, (purgeError, ok) => {
+                    connection.close();
+                    if (purgeError) {
+                        reject(purgeError);
+                    } else {
+                        console.log(`Purged ${ok.messageCount} message(s) from ${QUEUE_NAME}`);
+                        resolve(ok.messageCount);
+                    }
+                });
+            });
+        });
+    });
+
+    // Passive queue inspection: returns live message depth and the number of
+    // consumers currently attached to the queue, WITHOUT modifying anything.
+    // consumerCount > 1 is the tell-tale sign that the reconnect logic in run()
+    // has spawned overlapping consumers — each connection flap can leave the old
+    // consumer attached while a new one starts, and a redelivered job can then be
+    // processed by whichever consumer grabs it. Run `node index.js queue-stats`.
+    const queueStats = () => new Promise((resolve, reject) => {
+        amqp.connect(REQUEST_QUEUE_URL, { 'heartbeat': HEARTBEAT_SECONDS }, (connectionError, connection) => {
+            if (connectionError) {
+                reject(connectionError);
+                return;
+            }
+            connection.createChannel((channelError, channel) => {
+                if (channelError) {
+                    connection.close();
+                    reject(channelError);
+                    return;
+                }
+                channel.checkQueue(QUEUE_NAME, (err, ok) => {
+                    connection.close();
+                    if (err) {
+                        reject(err);
+                    } else {
+                        console.log(`${QUEUE_NAME}: messages=${ok.messageCount} consumers=${ok.consumerCount}`);
+                        resolve(ok);
+                    }
+                });
+            });
+        });
+    });
+
     const run = () => new Promise((resolve, reject) => {
-        amqp.connect(REQUEST_QUEUE_URL, { 'heartbeat': 1 }, (connectionError, connection) => {
+        console.log("RIRIRI" + REQUEST_QUEUE_URL);
+        amqp.connect(REQUEST_QUEUE_URL, { 'heartbeat': HEARTBEAT_SECONDS }, (connectionError, connection) => {
+            if (connectionError) {
+                // Let the setInterval guard retry; don't reconnect inline.
+                running = false;
+                reject(connectionError);
+                return;
+            }
+
+            // error and close both fire on a dropped connection (error precedes
+            // close), so reconnecting inline from each handler double-connects and
+            // stacks overlapping consumers. Instead just release the guard: the
+            // setInterval below restarts exactly ONE connection on its next tick.
             connection.on('error', (err) => {
                 console.error("queue error");
-                run();
+                console.error(err);
+                running = false;
             });
 
             connection.on('close', () => {
                 console.warn('queue connection closed');
-                run();
+                running = false;
             });
 
-            if (connectionError) {
-                reject(connectionError);
-            } else {
-                innerRun(connection).then(resolve).catch(reject);
-            }
+            innerRun(connection).then(resolve).catch(reject);
         });
     });
     
+    // Run `node index.js clear-queue` to empty the queue and exit, without
+    // starting the consumer loop.
+    if (process.argv.includes('clear-queue') || process.argv.includes('--clear-queue')) {
+        clearQueue().then((count) => {
+            console.log(`Done. Removed ${count} job(s) from ${QUEUE_NAME}.`);
+            process.exit(0);
+        }).catch((err) => {
+            console.error('Failed to clear queue');
+            console.error(err);
+            process.exit(1);
+        });
+        return;
+    }
+
+    // Run `node index.js queue-stats` to print queue depth + consumer count and exit.
+    if (process.argv.includes('queue-stats') || process.argv.includes('--queue-stats')) {
+        queueStats().then(() => {
+            process.exit(0);
+        }).catch((err) => {
+            console.error('Failed to read queue stats');
+            console.error(err);
+            process.exit(1);
+        });
+        return;
+    }
+
     // forever
     setInterval(() => {
         if (!running) {

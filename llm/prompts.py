@@ -46,22 +46,40 @@ def system_prompt() -> str:
     return SYSTEM_INSTRUCTIONS.format(authoring_doc=_authoring_doc())
 
 
-def build_messages(source: str, user_prompt: str, prev_attempt: dict = None) -> list[dict]:
+def build_messages(source: str, user_prompt: str, prev_attempt: dict = None, mode: str = None) -> list[dict]:
     """
     Build the chat messages for the model. The system message is constant
     (see system_prompt) so the worker can cache its KV state.
 
     prev_attempt, when given, is {"code": str, "error": str} from a failed
     validation pass, fed back so the model can correct itself.
+
+    mode "CREATE" means the author just created the game and `source` is the
+    blank starter template: frame the prompt as building a new game from
+    scratch instead of a change request. Only the user message varies — the
+    system prompt stays identical so the KV cache remains valid.
     """
-    user = (
-        "Here is the current index.js:\n\n"
-        "```javascript\n"
-        f"{source}\n"
-        "```\n\n"
-        f"Change request:\n{user_prompt}\n\n"
-        "Output the complete updated index.js."
-    )
+    if mode == "CREATE":
+        user = (
+            "The author has just created a brand-new game. Its index.js is "
+            "currently the starter template:\n\n"
+            "```javascript\n"
+            f"{source}\n"
+            "```\n\n"
+            f"The author wants you to build this game:\n{user_prompt}\n\n"
+            "Write a complete, playable implementation of the requested game, "
+            "replacing the starter template entirely. Output the complete new "
+            "index.js."
+        )
+    else:
+        user = (
+            "Here is the current index.js:\n\n"
+            "```javascript\n"
+            f"{source}\n"
+            "```\n\n"
+            f"Change request:\n{user_prompt}\n\n"
+            "Output the complete updated index.js."
+        )
     if prev_attempt:
         user += (
             "\n\nYour previous attempt failed validation with this error:\n"

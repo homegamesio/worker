@@ -7,7 +7,8 @@ local MLX model once (kept warm) and answers "modify my game" generation
 requests over a line-delimited JSON protocol on stdin/stdout:
 
     stdin  (one JSON object per line):
-        {"id": "<requestId>", "source": "<current index.js>", "prompt": "<edit request>"}
+        {"id": "<requestId>", "source": "<current index.js>", "prompt": "<edit request>",
+         "mode": "CREATE"?}  # mode CREATE = generate a new game from the starter template
 
     stdout (one JSON object per line):
         {"id": "...", "status": "COMPLETED", "result": "<new index.js>"}
@@ -84,17 +85,47 @@ def _build_system_cache():
         import mlx.core as mx
         from mlx_lm.models.cache import make_prompt_cache
 
-        sys_text = _tokenizer.apply_chat_template(
+        # Tokenize the system prefix the same way run_model tokenizes the full
+        # prompt (apply_chat_template), so the cached ids are a true prefix of it.
+        _sys_token_ids = list(_tokenizer.apply_chat_template(
             [{"role": "system", "content": system_prompt()}],
             add_generation_prompt=False,
-            tokenize=False,
-        )
-        _sys_token_ids = list(_tokenizer.encode(sys_text))
-        _sys_cache = make_prompt_cache(_model)
-        _model(mx.array(_sys_token_ids)[None], cache=_sys_cache)
-        mx.eval([c.state for c in _sys_cache])
+            tokenize=True,
+        ))
+        prompt = mx.array(_sys_token_ids)[None]
+
+        # Prefill in chunks rather than one shot. A single forward pass over all
+        # ~8.7k tokens spikes activation memory hard — enough to get the process
+        # OOM-killed (Jetsam SIGKILL) on a 24GB machine running the 14B. Feeding
+        # the cache CHUNK_TOKENS at a time, eval'ing between chunks, builds the
+        # identical KV cache while keeping the transient footprint bounded.
+        chunk = config.PREFILL_CHUNK_TOKENS
+
+        def _prefill(model, cache):
+            for i in range(0, prompt.shape[1], chunk):
+                model(prompt[:, i:i + chunk], cache=cache)
+                mx.eval([c.state for c in cache])
+
+        # Prefill the prefix into the MAIN model's cache, and — when speculative
+        # decoding is on — the DRAFT model's cache too. mlx-lm's speculative path
+        # splits a passed prompt_cache into cache[:len(model.layers)] (main) and
+        # cache[len(model.layers):] (draft); if the draft half is missing it hits
+        # an IndexError, the fast path fails, and we re-prefill the whole guide on
+        # every request. So the combined cache must carry both halves.
+        model_cache = make_prompt_cache(_model)
+        _prefill(_model, model_cache)
+        caches = list(model_cache)
+
+        if _draft_model is not None and _draft_ok:
+            draft_cache = make_prompt_cache(_draft_model)
+            _prefill(_draft_model, draft_cache)
+            caches += list(draft_cache)
+
+        mx.eval([c.state for c in caches])
+        _sys_cache = caches
         _sys_len = len(_sys_token_ids)
-        log(f"Cached system prefix ({_sys_len} tokens).")
+        _kind = 'main+draft' if (_draft_model is not None and _draft_ok) else 'main'
+        log(f"Cached system prefix ({_sys_len} tokens, {_kind} cache).")
     except Exception as e:  # noqa: BLE001
         log(
             f"WARNING: could not cache system prompt ({e}); "
@@ -111,12 +142,12 @@ def _draft_kwargs():
     return {}
 
 
-def _stream(prompt, prompt_cache):
+def _stream(prompt, prompt_cache, max_tokens=None):
     """Run stream_generate, transparently dropping draft kwargs if unsupported."""
     global _draft_ok
     from mlx_lm import stream_generate
 
-    kwargs = {"max_tokens": config.MAX_TOKENS}
+    kwargs = {"max_tokens": max_tokens or config.MAX_TOKENS}
     if prompt_cache is not None:
         kwargs["prompt_cache"] = prompt_cache
     kwargs.update(_draft_kwargs())
@@ -135,11 +166,27 @@ def _stream(prompt, prompt_cache):
         raise
 
 
-def run_model(source: str, user_prompt: str, prev_attempt: dict = None) -> str:
+def run_model(source: str, user_prompt: str, prev_attempt: dict = None, max_tokens=None, mode: str = None) -> str:
     """Run the model and return the raw generated text."""
     model, tokenizer = load_model()
-    messages = build_messages(source, user_prompt, prev_attempt)
+    messages = build_messages(source, user_prompt, prev_attempt, mode)
     full_ids = list(tokenizer.apply_chat_template(messages, add_generation_prompt=True))
+
+    # Bound total context (prompt + generated) to cap KV-cache memory. The cache
+    # grows one entry per token, so peak KV memory ~= MAX_CONTEXT_TOKENS tokens.
+    # Reject inputs that already overflow it (fail fast instead of OOM-killing),
+    # and clamp generation so prompt + output stays within the window. max_tokens
+    # is only passed explicitly by warmup, which stays tiny — leave it alone then.
+    if max_tokens is None:
+        budget = config.MAX_CONTEXT_TOKENS - len(full_ids)
+        if budget <= 0:
+            raise ValueError(
+                f"prompt is {len(full_ids)} tokens, over MAX_CONTEXT_TOKENS "
+                f"({config.MAX_CONTEXT_TOKENS}); shrink the game source or raise the cap"
+            )
+        max_tokens = min(config.MAX_TOKENS, budget)
+        log(f"context budget: prompt={len(full_ids)} tokens, "
+            f"max_new={max_tokens} (window={config.MAX_CONTEXT_TOKENS})")
 
     # Fast path: reuse the cached system prefix, generating only the delta.
     if _sys_cache is not None and full_ids[:_sys_len] == _sys_token_ids:
@@ -148,21 +195,46 @@ def run_model(source: str, user_prompt: str, prev_attempt: dict = None) -> str:
             from mlx_lm.models.cache import trim_prompt_cache
 
             delta = full_ids[_sys_len:]
-            text = _stream(mx.array(delta), _sys_cache)
-            # Restore the cache to the pristine system prefix for next time.
-            extra = _sys_cache[0].offset - _sys_len
-            if extra > 0:
-                trim_prompt_cache(_sys_cache, extra)
+            log(f"prompt cache HIT: reusing {_sys_len} cached system tokens, "
+                f"prefilling {len(delta)} delta tokens")
+            text = _stream(mx.array(delta), _sys_cache, max_tokens=max_tokens)
+            # Restore every cache entry to the pristine system prefix for next
+            # time. The main and draft halves can advance by different amounts
+            # under speculative decoding, so trim each entry by its own offset
+            # rather than assuming a single shared length.
+            for c in _sys_cache:
+                extra = c.offset - _sys_len
+                if extra > 0:
+                    trim_prompt_cache([c], extra)
             return text
         except Exception as e:  # noqa: BLE001
             log(f"WARNING: cached generation failed ({e}); full prefill")
             _build_system_cache()  # rebuild a possibly-corrupted cache
+    else:
+        reason = "no cache" if _sys_cache is None else "prefix mismatch"
+        log(f"prompt cache MISS ({reason}): prefilling full {len(full_ids)} tokens")
 
     # Fallback: prefill the whole prompt. Always correct.
     full_text = tokenizer.apply_chat_template(
         messages, add_generation_prompt=True, tokenize=False
     )
-    return _stream(full_text, None)
+    return _stream(full_text, None, max_tokens=max_tokens)
+
+
+def _warmup():
+    """
+    Run a tiny end-to-end generation so the first real request doesn't pay
+    MLX's one-time, lazy Metal-kernel compilation for the decode + speculative
+    path. Exercises the same fast-path machinery as a real job (cache reuse,
+    draft verification, cache trim) and leaves the system cache pristine. Best
+    effort: a warmup failure must not stop the server from serving.
+    """
+    try:
+        log("warming generation path...")
+        run_model("module.exports = {};", "noop", max_tokens=4)
+        log("warmup complete.")
+    except Exception as e:  # noqa: BLE001
+        log(f"WARNING: warmup failed ({e}); first request will be slower")
 
 
 def validate_js(code: str) -> str | None:
@@ -207,13 +279,14 @@ def process_job(job: dict) -> dict:
     """
     source = job.get("source", "")
     user_prompt = job.get("prompt", "")
-    log(f"Processing {job.get('id')}: {user_prompt[:80]!r}")
+    mode = job.get("mode")
+    log(f"Processing {job.get('id')} (mode={mode or 'EDIT'}): {user_prompt[:80]!r}")
 
     prev_attempt = None
     last_error = None
     for attempt in range(config.MAX_RETRIES + 1):
         try:
-            raw = run_model(source, user_prompt, prev_attempt)
+            raw = run_model(source, user_prompt, prev_attempt, mode=mode)
         except Exception as e:  # noqa: BLE001 - report any failure back to the user
             last_error = str(e)[:500]
             log(f"  -> generation error: {last_error}")
@@ -239,8 +312,11 @@ def _emit(obj: dict):
 
 
 def main():
-    # Warm the model before announcing readiness so the first job isn't slow.
+    # Warm the model AND the generation path before announcing readiness, so the
+    # first real job isn't slow: load_model() builds the system-prompt cache,
+    # _warmup() compiles the lazy decode/speculative kernels.
     load_model()
+    _warmup()
     _emit({"ready": True})
     log("Model server ready; reading jobs on stdin.")
 

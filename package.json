@@ -3,6 +3,7 @@
     "acme-client": "^5.4.0",
     "amqplib": "^0.10.4",
     "aws-sdk": "^2.1691.0",
+    "homegames-common": "file:../homegames-common",
     "mongodb": "^6.8.0",
     "node-llama-cpp": "^2.8.8",
     "uuid": "^10.0.0"

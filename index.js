@@ -49,7 +49,19 @@ const { MongoClient } = require('mongodb');
     const LLM_WORKER_SECRET = process.env.LLM_WORKER_SECRET || '';
     const LLM_PYTHON = process.env.LLM_PYTHON || path.join(__dirname, 'llm', 'env', 'bin', 'python');
     const LLM_SERVER_PATH = process.env.LLM_SERVER_PATH || path.join(__dirname, 'llm', 'model_server.py');
-    
+
+    // The authoring guide that grounds the model is the single source of truth in
+    // homegames-common. Resolve its path and hand it to the Python model server
+    // via AUTHORING_DOC_PATH, so there's no per-repo copy to drift out of date.
+    let AUTHORING_DOC_PATH = process.env.AUTHORING_DOC_PATH;
+    if (!AUTHORING_DOC_PATH) {
+        try {
+            AUTHORING_DOC_PATH = path.join(path.dirname(require.resolve('homegames-common')), 'docs', 'squishjs-game-authoring.md');
+        } catch (err) {
+            console.warn('[llm] homegames-common not resolvable; set AUTHORING_DOC_PATH to ground the model with the authoring guide');
+        }
+    }
+
     const DB_NAME = process.env.DB_NAME;
     const DB_HOST = process.env.DB_HOST;
     const DB_PORT = process.env.DB_PORT
@@ -267,7 +279,7 @@ const { MongoClient } = require('mongodb');
 
             const key = data.key.data;
             const client = new acme.Client({
-                directoryUrl: acme.directory.letsencrypt.staging,
+                directoryUrl: acme.directory.letsencrypt.production,
                 accountKey: key
             });
 
@@ -322,6 +334,7 @@ const { MongoClient } = require('mongodb');
     };
 
     const handleLlmLine = (line) => {
+        console.log('what the fuck!');
         let msg;
         try {
             msg = JSON.parse(line);
@@ -348,7 +361,10 @@ const { MongoClient } = require('mongodb');
         console.log('[llm] spawning model server: ' + LLM_PYTHON + ' ' + LLM_SERVER_PATH);
         llmReady = false;
         llmStdoutBuf = '';
-        const child = spawn(LLM_PYTHON, [LLM_SERVER_PATH], { stdio: ['pipe', 'pipe', 'pipe'] });
+        const child = spawn(LLM_PYTHON, [LLM_SERVER_PATH], {
+            stdio: ['pipe', 'pipe', 'pipe'],
+            env: AUTHORING_DOC_PATH ? { ...process.env, AUTHORING_DOC_PATH } : process.env,
+        });
 
         // stdout is the protocol channel: newline-delimited JSON only.
         child.stdout.setEncoding('utf8');
@@ -420,7 +436,13 @@ const { MongoClient } = require('mongodb');
     }));
 
     // POST the model server's result to the API. result = {id, status, result?, error?}.
-    const postLlmResult = (requestId, result) => {
+    // The job is only acked once this resolves, and with prefetch(1) an unacked
+    // job blocks all further deliveries — so a fetch with NO timeout against a
+    // slow/unreachable API would silently wedge the whole consumer. Bound each
+    // attempt and retry a few times (the generated result is expensive to lose),
+    // then give up so the consumer can ack-drop and move on.
+    const postLlmResult = (requestId, result, attempt = 1) => {
+        const MAX_ATTEMPTS = 3;
         const payload = { requestId, status: result.status };
         if (result.result != null) payload.result = result.result;
         if (result.error != null) payload.error = result.error;
@@ -430,7 +452,8 @@ const { MongoClient } = require('mongodb');
                 'Content-Type': 'application/json',
                 'Authorization': `Bearer ${LLM_WORKER_SECRET}`
             },
-            body: JSON.stringify(payload)
+            body: JSON.stringify(payload),
+            signal: AbortSignal.timeout(30000)
         }).then((resp) => {
             if (!resp.ok) {
                 return resp.text().then((text) => {
@@ -438,11 +461,19 @@ const { MongoClient } = require('mongodb');
                 });
             }
             console.log(`[llm] posted ${result.status} for ${requestId}`);
+        }).catch((err) => {
+            if (attempt < MAX_ATTEMPTS) {
+                console.error(`[llm] post attempt ${attempt}/${MAX_ATTEMPTS} for ${requestId} failed (${err && err.message}); retrying`);
+                return new Promise(r => setTimeout(r, 2000 * attempt))
+                    .then(() => postLlmResult(requestId, result, attempt + 1));
+            }
+            throw err;
         });
     };
 
     const handleLlmRequest = (data) => new Promise((resolve, reject) => {
-        const job = { id: data.requestId, source: data.source, prompt: data.prompt };
+        // mode 'CREATE' = write a new game from the starter template (absent = edit)
+        const job = { id: data.requestId, source: data.source, prompt: data.prompt, mode: data.mode };
         // 10 min backstop: covers a cold child's model load plus generation.
         withTimeout(runLlmJob(job), 10 * 60 * 1000, 'LLM model server').then(
             (result) => {
@@ -500,13 +531,27 @@ const { MongoClient } = require('mongodb');
                 channel.assertQueue(QUEUE_NAME, {
                     durable: true
                 });
+                // Warn if another consumer is already attached: RabbitMQ round-robins
+                // deliveries across ALL consumers, so a stray second worker (or a
+                // leftover process) silently steals a share of the jobs — they just
+                // never show up here. Run exactly one worker. (consumerCount here
+                // excludes us, since we haven't called consume() yet.)
+                channel.checkQueue(QUEUE_NAME, (qErr, ok) => {
+                    if (!qErr && ok && ok.consumerCount > 0) {
+                        console.warn(`[warn] ${ok.consumerCount} other consumer(s) already attached to ` +
+                            `${QUEUE_NAME} — jobs will be round-robined and some will NOT reach this worker. ` +
+                            `Kill the strays (pkill -f "node index.js") and run a single instance.`);
+                    }
+                });
                 // One unacked message at a time. Without this the broker pushes the
                 // entire backlog to a single consumer at once; cert jobs run for
                 // minutes, so a connection flap would strand (and later redeliver)
                 // every in-flight job instead of just one.
-                channel.prefetch(1);
+//                channel.prefetch(1);
                 console.log('listening to messages on ' + QUEUE_NAME + ' at ' + REQUEST_QUEUE_URL);
                 channel.consume(QUEUE_NAME, (msg) => {
+                    console.log('got a damn message');
+                    console.log(msg);
                     // null msg means the consumer was cancelled by the broker.
                     if (!msg) return;
 
@@ -675,15 +720,29 @@ const { MongoClient } = require('mongodb');
     }
 
     // Don't leave the Python model server orphaned when the worker stops.
+    // SIGKILL (not SIGTERM): during model load the child is in a native MLX
+    // call where Python defers signal handlers, so SIGTERM can be ignored long
+    // enough to orphan it. The server has no state to flush, so a hard kill is
+    // fine. (If node itself crashes without running this, the child still exits
+    // on its own once it finishes loading and reads EOF on the closed stdin.)
     const shutdown = (signal) => {
         console.log('received ' + signal + ', shutting down');
         if (llmChild) {
-            try { llmChild.kill('SIGTERM'); } catch (e) { /* already dead */ }
+            try { llmChild.kill('SIGKILL'); } catch (e) { /* already dead */ }
         }
         process.exit(0);
     };
     process.on('SIGINT', () => shutdown('SIGINT'));
     process.on('SIGTERM', () => shutdown('SIGTERM'));
+
+    // Eagerly spawn + warm the model server at boot (not lazily on the first
+    // job), so the model is loaded and the generation path is compiled before
+    // any LLM_REQUEST arrives. Placed after the CLI early-returns so queue-stats
+    // / clear-queue don't trigger a model load. Best effort: if it fails (e.g.
+    // missing venv on a cert-only box), the first LLM job will retry the spawn.
+    ensureModelServer()
+        .then(() => console.log('[llm] model server warmed and ready at startup'))
+        .catch((err) => console.error('[llm] startup warm failed (will retry on first job): ' + (err && err.message)));
 
     // forever
     setInterval(() => {

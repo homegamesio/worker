@@ -45,6 +45,7 @@ _tokenizer = None
 _draft_model = None       # optional speculative-decoding draft model
 _draft_ok = True          # flipped off if the installed mlx_lm can't take it
 _sys_cache = None         # KV cache holding the static system prompt prefix
+_sys_snapshot = []        # pristine states for non-trimmable (recurrent) entries
 _sys_token_ids = []       # the tokens that prefix represents
 _sys_len = 0
 
@@ -58,7 +59,17 @@ def load_model():
         log(f"Loading MLX model: {config.MODEL}")
         _model, _tokenizer = load(config.MODEL)
 
-        if config.DRAFT_MODEL:
+        # Hybrid-attention models (e.g. Qwen 3.5) carry recurrent state in
+        # non-trimmable cache entries; mlx-lm's speculative decoder refuses
+        # those outright ("requires a trimmable prompt cache"), so skip the
+        # draft model rather than failing every request.
+        from mlx_lm.models.cache import can_trim_prompt_cache, make_prompt_cache
+        if config.DRAFT_MODEL and not can_trim_prompt_cache(make_prompt_cache(_model)):
+            log(
+                f"WARNING: {config.MODEL} uses a non-trimmable (hybrid) cache; "
+                "speculative decoding is unsupported — ignoring DRAFT_MODEL"
+            )
+        elif config.DRAFT_MODEL:
             try:
                 log(f"Loading draft model: {config.DRAFT_MODEL}")
                 _draft_model, _ = load(config.DRAFT_MODEL)
@@ -80,7 +91,7 @@ def _build_system_cache():
     + instructions) once, so it isn't re-prefilled on every request. Best
     effort: on any failure we fall back to prefilling the full prompt.
     """
-    global _sys_cache, _sys_token_ids, _sys_len
+    global _sys_cache, _sys_snapshot, _sys_token_ids, _sys_len
     try:
         import mlx.core as mx
         from mlx_lm.models.cache import make_prompt_cache
@@ -123,6 +134,15 @@ def _build_system_cache():
 
         mx.eval([c.state for c in caches])
         _sys_cache = caches
+        # Trimmable (KV) entries are restored after each request by trimming
+        # back to the prefix length. Recurrent entries (ArraysCache in hybrid
+        # models like Qwen 3.5) have no offset and can't be rewound, so keep a
+        # snapshot of their pristine state to restore instead. Safe as a
+        # shallow copy: those layers rebind their state arrays, never mutate
+        # them in place.
+        _sys_snapshot = [
+            None if c.is_trimmable() else list(c.state) for c in caches
+        ]
         _sys_len = len(_sys_token_ids)
         _kind = 'main+draft' if (_draft_model is not None and _draft_ok) else 'main'
         log(f"Cached system prefix ({_sys_len} tokens, {_kind} cache).")
@@ -132,6 +152,7 @@ def _build_system_cache():
             "prefilling it on each request"
         )
         _sys_cache = None
+        _sys_snapshot = []
         _sys_token_ids = []
         _sys_len = 0
 
@@ -201,11 +222,16 @@ def run_model(source: str, user_prompt: str, prev_attempt: dict = None, max_toke
             # Restore every cache entry to the pristine system prefix for next
             # time. The main and draft halves can advance by different amounts
             # under speculative decoding, so trim each entry by its own offset
-            # rather than assuming a single shared length.
-            for c in _sys_cache:
-                extra = c.offset - _sys_len
-                if extra > 0:
-                    trim_prompt_cache([c], extra)
+            # rather than assuming a single shared length. Recurrent entries
+            # (hybrid models) have no offset to trim; reset them from the
+            # snapshot taken at build time.
+            for c, snap in zip(_sys_cache, _sys_snapshot):
+                if c.is_trimmable():
+                    extra = c.offset - _sys_len
+                    if extra > 0:
+                        trim_prompt_cache([c], extra)
+                else:
+                    c.state = list(snap)
             return text
         except Exception as e:  # noqa: BLE001
             log(f"WARNING: cached generation failed ({e}); full prefill")
@@ -245,7 +271,12 @@ def validate_js(code: str) -> str | None:
     if not code.strip():
         return "Model returned empty output"
     if "module.exports" not in code:
-        return "Output does not export a game (no module.exports)"
+        return (
+            "Your output was not a game file (no module.exports found). "
+            "You must respond with the complete index.js source code in a "
+            "```javascript code block — never with prose, questions, or "
+            "explanations."
+        )
 
     with tempfile.NamedTemporaryFile(
         "w", suffix=".js", delete=False, encoding="utf-8"

@@ -44,10 +44,12 @@ const { MongoClient } = require('mongodb');
 
     // --- LLM model server -------------------------------------------------
     // LLM generation runs in a long-lived Python child (llm/model_server.py)
-    // that keeps the MLX model warm. Node owns the queue + result-posting; the
-    // child only generates. See handleLlmRequest / ensureModelServer below.
+    // that forwards requests to LM Studio's OpenAI-compatible server. Node owns
+    // the queue + result-posting; the child only generates. See
+    // handleLlmRequest / ensureModelServer below.
     const LLM_WORKER_SECRET = process.env.LLM_WORKER_SECRET || '';
-    const LLM_PYTHON = process.env.LLM_PYTHON || path.join(__dirname, 'llm', 'env', 'bin', 'python');
+    // The child has no Python dependencies, so any python3 on PATH works.
+    const LLM_PYTHON = process.env.LLM_PYTHON || 'python3';
     const LLM_SERVER_PATH = process.env.LLM_SERVER_PATH || path.join(__dirname, 'llm', 'model_server.py');
 
     // The authoring guide that grounds the model is the single source of truth in

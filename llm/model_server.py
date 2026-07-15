@@ -111,6 +111,10 @@ def run_model(source: str, user_prompt: str, prev_attempt: dict = None, max_toke
         "max_tokens": max_tokens or config.MAX_TOKENS,
         "temperature": config.TEMPERATURE,
         "stream": False,
+        # llama.cpp-style hint to reuse the KV cache for the shared prefix
+        # (our ~25k-token system prompt is identical every request). Servers
+        # that don't know the field ignore it.
+        "cache_prompt": True,
     }
     start = time.monotonic()
     resp = _http_json("/chat/completions", payload, timeout=config.REQUEST_TIMEOUT_SECONDS)

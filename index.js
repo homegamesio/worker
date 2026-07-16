@@ -33,10 +33,14 @@ const { MongoClient } = require('mongodb');
     // redelivery (observed as redelivered=true). 30s tolerates normal jitter.
     const HEARTBEAT_SECONDS = 30;
     
-    // This worker handles exactly two job types off the unified homegames-jobs
-    // queue: ACME certificate generation, and LLM "modify my game" requests.
+    // This worker handles three job types off the unified homegames-jobs
+    // queue: ACME certificate generation, LLM "modify my game" requests
+    // (currently disabled at the API — AI_EDITS_ENABLED — because local models
+    // aren't good/fast enough for full game generation yet), and docs
+    // questions from the "ask something" box on homegames.io/docs.html.
     const CERT_REQUEST = 'CERT_REQUEST';
     const LLM_REQUEST = 'LLM_REQUEST';
+    const DOCS_QUESTION = 'DOCS_QUESTION';
 
     let running = false;
 
@@ -61,6 +65,18 @@ const { MongoClient } = require('mongodb');
             AUTHORING_DOC_PATH = path.join(path.dirname(require.resolve('homegames-common')), 'docs', 'squishjs-game-authoring.md');
         } catch (err) {
             console.warn('[llm] homegames-common not resolvable; set AUTHORING_DOC_PATH to ground the model with the authoring guide');
+        }
+    }
+
+    // The knowledge doc that grounds docs-question answers (a compact
+    // whole-platform reference, distinct from the game-authoring guide).
+    // Same single-source-of-truth arrangement: it lives in homegames-common.
+    let KNOWLEDGE_DOC_PATH = process.env.KNOWLEDGE_DOC_PATH;
+    if (!KNOWLEDGE_DOC_PATH) {
+        try {
+            KNOWLEDGE_DOC_PATH = path.join(path.dirname(require.resolve('homegames-common')), 'docs', 'homegames-knowledge.md');
+        } catch (err) {
+            console.warn('[llm] homegames-common not resolvable; set KNOWLEDGE_DOC_PATH to ground docs answers');
         }
     }
 
@@ -363,9 +379,12 @@ const { MongoClient } = require('mongodb');
         console.log('[llm] spawning model server: ' + LLM_PYTHON + ' ' + LLM_SERVER_PATH);
         llmReady = false;
         llmStdoutBuf = '';
+        const docEnv = {};
+        if (AUTHORING_DOC_PATH) docEnv.AUTHORING_DOC_PATH = AUTHORING_DOC_PATH;
+        if (KNOWLEDGE_DOC_PATH) docEnv.KNOWLEDGE_DOC_PATH = KNOWLEDGE_DOC_PATH;
         const child = spawn(LLM_PYTHON, [LLM_SERVER_PATH], {
             stdio: ['pipe', 'pipe', 'pipe'],
-            env: AUTHORING_DOC_PATH ? { ...process.env, AUTHORING_DOC_PATH } : process.env,
+            env: { ...process.env, ...docEnv },
         });
 
         // stdout is the protocol channel: newline-delimited JSON only.
@@ -492,12 +511,67 @@ const { MongoClient } = require('mongodb');
         );
     });
 
+    // POST a docs-question answer to the API. Same retry/timeout discipline as
+    // postLlmResult, different endpoint and payload shape.
+    const postDocsAnswer = (requestId, result, attempt = 1) => {
+        const MAX_ATTEMPTS = 3;
+        const payload = { requestId, status: result.status };
+        if (result.result != null) payload.answer = result.result;
+        if (result.error != null) payload.error = result.error;
+        return fetch(`${API_URL}/internal/docs-answer`, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'Authorization': `Bearer ${LLM_WORKER_SECRET}`
+            },
+            body: JSON.stringify(payload),
+            signal: AbortSignal.timeout(30000)
+        }).then((resp) => {
+            if (!resp.ok) {
+                return resp.text().then((text) => {
+                    throw new Error(`/internal/docs-answer returned ${resp.status}: ${text.slice(0, 200)}`);
+                });
+            }
+            console.log(`[docs] posted ${result.status} for ${requestId}`);
+        }).catch((err) => {
+            if (attempt < MAX_ATTEMPTS) {
+                console.error(`[docs] post attempt ${attempt}/${MAX_ATTEMPTS} for ${requestId} failed (${err && err.message}); retrying`);
+                return new Promise(r => setTimeout(r, 2000 * attempt))
+                    .then(() => postDocsAnswer(requestId, result, attempt + 1));
+            }
+            throw err;
+        });
+    };
+
+    const handleDocsQuestion = (data) => new Promise((resolve, reject) => {
+        const job = { id: data.requestId, kind: 'docs', prompt: data.question };
+        // Docs answers are short; a user is actively waiting on the page, so
+        // fail fast relative to game generation. 5 min covers a cold model load.
+        withTimeout(runLlmJob(job), 5 * 60 * 1000, 'LLM model server (docs)').then(
+            (result) => {
+                postDocsAnswer(data.requestId, result).then(resolve).catch(reject);
+            },
+            (err) => {
+                console.error('[docs] answer failed for ' + data.requestId + ': ' + (err && err.message));
+                restartModelServer();
+                // Best-effort FAILED post so the asker's poll resolves instead
+                // of spinning until the UI timeout.
+                postDocsAnswer(data.requestId, { status: 'FAILED', error: 'generation failed' })
+                    .catch(() => {})
+                    .finally(() => reject(err));
+            }
+        );
+    });
+
     const messageHandlers = {
         [CERT_REQUEST]: {
             handle: handleCertRequest
         },
         [LLM_REQUEST]: {
             handle: handleLlmRequest
+        },
+        [DOCS_QUESTION]: {
+            handle: handleDocsQuestion
         }
     };
     

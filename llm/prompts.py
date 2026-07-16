@@ -117,6 +117,59 @@ def build_messages(source: str, user_prompt: str, prev_attempt: dict = None, mod
     ]
 
 
+DOCS_SYSTEM_INSTRUCTIONS = """\
+You are the Homegames docs assistant, answering questions from visitors to \
+homegames.io's documentation page. Homegames is a free, open-source (GPLv3) \
+platform for making, sharing, and playing simple multiplayer browser games.
+
+Rules:
+- Answer using ONLY the reference document below. If the reference doesn't \
+cover the question, say you're not sure and suggest the docs page \
+(homegames.io/docs.html) or emailing joseph@homegames.io.
+- Keep answers short: a few sentences, or a short list. Include a small code \
+snippet only when it directly answers the question.
+- You answer questions — you do NOT write games. If asked to write a complete \
+game or a large amount of code, explain that you can't generate games, and \
+point to the Studio's templates and the docs instead.
+- If the question is not about Homegames or making Homegames games, say you \
+can only help with Homegames.
+- Plain text or simple markdown only. No greetings or sign-offs.
+
+Reference document:
+
+---
+{knowledge_doc}
+---
+"""
+
+
+@functools.lru_cache(maxsize=1)
+def _knowledge_doc() -> str:
+    try:
+        with open(config.KNOWLEDGE_DOC_PATH, "r", encoding="utf-8") as f:
+            return f.read()
+    except OSError:
+        print(
+            f"WARNING: knowledge doc not found at {config.KNOWLEDGE_DOC_PATH}; "
+            "proceeding without it.",
+            flush=True,
+        )
+        return "(knowledge doc unavailable)"
+
+
+def docs_system_prompt() -> str:
+    """Static system prompt for docs Q&A. Identical every request (KV-cacheable)."""
+    return DOCS_SYSTEM_INSTRUCTIONS.format(knowledge_doc=_knowledge_doc())
+
+
+def build_docs_messages(question: str) -> list[dict]:
+    """Chat messages for one docs question."""
+    return [
+        {"role": "system", "content": docs_system_prompt()},
+        {"role": "user", "content": question},
+    ]
+
+
 _FENCE_RE = re.compile(r"```(?:javascript|js)?\s*\n(.*?)```", re.DOTALL)
 
 

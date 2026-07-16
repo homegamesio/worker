@@ -9,9 +9,11 @@ answers over a line-delimited JSON protocol on stdin/stdout:
     stdin  (one JSON object per line):
         {"id": "<requestId>", "source": "<current index.js>", "prompt": "<edit request>",
          "mode": "CREATE"?}  # mode CREATE = generate a new game from the starter template
+        {"id": "<requestId>", "kind": "docs", "prompt": "<question>"}
+                             # docs Q&A: short grounded answer, no code extraction/validation
 
     stdout (one JSON object per line):
-        {"id": "...", "status": "COMPLETED", "result": "<new index.js>"}
+        {"id": "...", "status": "COMPLETED", "result": "<new index.js or docs answer>"}
         {"id": "...", "status": "FAILED",    "error": "<message>"}
 
     Plus exactly one readiness line, emitted once the server is reachable and
@@ -38,7 +40,7 @@ import urllib.error
 import urllib.request
 
 import config
-from prompts import build_messages, extract_code
+from prompts import build_docs_messages, build_messages, extract_code
 
 # All human-readable output goes to stderr; stdout is reserved for protocol.
 log = functools.partial(print, file=sys.stderr, flush=True)
@@ -102,9 +104,14 @@ def wait_for_server():
             delay = min(delay * 2, 30)
 
 
-def run_model(source: str, user_prompt: str, prev_attempt: dict = None, max_tokens=None, mode: str = None) -> str:
-    """Send one chat completion to LM Studio and return the raw generated text."""
-    messages = build_messages(source, user_prompt, prev_attempt, mode)
+def run_model(source: str, user_prompt: str, prev_attempt: dict = None, max_tokens=None, mode: str = None, messages: list = None) -> str:
+    """Send one chat completion to LM Studio and return the raw generated text.
+
+    Callers either let this build the game-edit messages (default) or pass
+    prebuilt `messages` (docs Q&A path).
+    """
+    if messages is None:
+        messages = build_messages(source, user_prompt, prev_attempt, mode)
     payload = {
         "model": _model_name,
         "messages": messages,
@@ -138,10 +145,15 @@ def _warmup():
     JIT-loads a model on its first request, which can take minutes for a 31B —
     paying that here means the first real job doesn't. Best effort: a warmup
     failure must not stop the server from serving.
+
+    Warms the DOCS prompt: it's the only live path (game edits are disabled at
+    the API), it primes the exact KV prefix real questions reuse, and at ~4-5k
+    tokens it fits a model loaded with a small (8k) context — the game-edit
+    prompt embeds the full authoring guide (~25k tokens) and would 400 there.
     """
     try:
         log("warming up (may trigger LM Studio's model load)...")
-        run_model("module.exports = {};", "noop", max_tokens=4)
+        run_model("", "", messages=build_docs_messages("noop"), max_tokens=4)
         log("warmup complete.")
     except Exception as e:  # noqa: BLE001
         log(f"WARNING: warmup failed ({e}); first request will be slower")
@@ -186,12 +198,43 @@ def validate_js(code: str) -> str | None:
     return None
 
 
+def process_docs_job(job: dict) -> dict:
+    """
+    Answer one docs question ("ask something" box). No code extraction, no
+    validation, no retries — just a short grounded answer.
+    """
+    question = job.get("prompt", "")
+    log(f"Processing docs question {job.get('id')}: {question[:80]!r}")
+    try:
+        raw = run_model(
+            "", "",
+            messages=build_docs_messages(question),
+            max_tokens=config.DOCS_MAX_TOKENS,
+        )
+    except Exception as e:  # noqa: BLE001 - report any failure back
+        err = str(e)[:500]
+        log(f"  -> docs generation error: {err}")
+        return {"status": "FAILED", "error": err}
+
+    answer = raw.strip()
+    if not answer:
+        return {"status": "FAILED", "error": "Model returned empty answer"}
+    log(f"  -> answered ({len(answer)} chars)")
+    return {"status": "COMPLETED", "result": answer}
+
+
 def process_job(job: dict) -> dict:
     """
     Run one generation job. Returns a result dict (without the id, which the
     caller fills in): {"status": "COMPLETED", "result": code} or
     {"status": "FAILED", "error": message}.
+
+    kind "docs" = a docs question (see process_docs_job); anything else is a
+    game-edit job.
     """
+    if job.get("kind") == "docs":
+        return process_docs_job(job)
+
     source = job.get("source", "")
     user_prompt = job.get("prompt", "")
     mode = job.get("mode")

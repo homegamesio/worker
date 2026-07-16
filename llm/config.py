@@ -16,7 +16,7 @@ LLM_SERVER_URL = os.environ.get("LLM_SERVER_URL", "http://localhost:1234/v1").rs
 
 # Model name to request, as LM Studio reports it (see GET /v1/models).
 # Leave empty to auto-select the first model the server lists.
-MODEL = os.environ.get("MODEL", "")
+MODEL = os.environ.get("MODEL", "google/gemma-4-26b-a4b")
 
 # Hard deadline for one generation request. A 31B GGUF producing a full game
 # can legitimately take several minutes; this only exists so a hung server
@@ -42,3 +42,14 @@ AUTHORING_DOC_PATH = os.environ.get(
     "AUTHORING_DOC_PATH",
     os.path.join(os.path.dirname(__file__), "squishjs-game-authoring.md"),
 )
+
+# Path to the whole-platform knowledge doc that grounds docs-question answers
+# ("ask something" box on homegames.io/docs.html). Same arrangement as the
+# authoring guide: canonical copy in homegames-common, resolved by the parent.
+KNOWLEDGE_DOC_PATH = os.environ.get(
+    "KNOWLEDGE_DOC_PATH",
+    os.path.join(os.path.dirname(__file__), "homegames-knowledge.md"),
+)
+
+# Docs answers are a paragraph or two, not a whole game file.
+DOCS_MAX_TOKENS = int(os.environ.get("DOCS_MAX_TOKENS", "1024"))

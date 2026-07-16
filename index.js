@@ -604,6 +604,32 @@ const { MongoClient } = require('mongodb');
             if (channelError) {
                 reject(channelError);
             } else {
+                // Channel-level failures don't fire the CONNECTION 'error'
+                // handler, and an 'error' event with no listener crashes the
+                // whole process — which is exactly what was killing the worker
+                // after an ECONNRESET. Log it; the paired 'close' below recycles.
+                channel.on('error', (err) => {
+                    console.error('channel error');
+                    console.error(err);
+                });
+                // A dead channel on a live connection consumes nothing forever.
+                // Tear the connection down so the setInterval guard rebuilds
+                // exactly one fresh connection + consumer.
+                channel.on('close', () => {
+                    console.warn('channel closed -> recycling connection');
+                    try { connection.close(); } catch (e) { /* already closing */ }
+                    running = false;
+                });
+                // Acking on a channel that died since delivery throws; the
+                // broker requeues the message itself in that case, so just log
+                // and let redelivery handle it instead of crashing.
+                const safeAck = (msg, label) => {
+                    try {
+                        channel.ack(msg);
+                    } catch (err) {
+                        console.error(`[job] ack failed (${label}) — channel dead, broker will redeliver: ` + (err && err.message));
+                    }
+                };
                 channel.assertQueue(QUEUE_NAME, {
                     durable: true
                 });
@@ -628,8 +654,15 @@ const { MongoClient } = require('mongodb');
                 channel.consume(QUEUE_NAME, (msg) => {
                     console.log('got a damn message');
                     console.log(msg);
-                    // null msg means the consumer was cancelled by the broker.
-                    if (!msg) return;
+                    // null msg means the consumer was cancelled by the broker
+                    // (queue deleted, node failover). The connection is still
+                    // "up" but delivers nothing — recycle it so we re-consume.
+                    if (!msg) {
+                        console.warn('consumer cancelled by broker -> recycling connection');
+                        try { connection.close(); } catch (e) { /* already closing */ }
+                        running = false;
+                        return;
+                    }
 
                     // Greppable per-delivery summary (grep '[job]') so duplicate
                     // processing is easy to spot. The distinction that matters:
@@ -654,10 +687,10 @@ const { MongoClient } = require('mongodb');
 
                     handleMessage(msg).then(() => {
                         console.log(`[job] done type=${summary.type} ip=${summary.ip} deliveryTag=${msg.fields.deliveryTag} -> ack`);
-                        // Ack on success so it's removed from the queue. NOTE: if the
-                        // channel that delivered this msg has since closed (reconnect),
-                        // this ack throws / no-ops and the broker will redeliver.
-                        channel.ack(msg);
+                        // Ack on success so it's removed from the queue. If the
+                        // channel that delivered this msg has since closed
+                        // (reconnect), the broker redelivers it instead.
+                        safeAck(msg, 'success');
                     }).catch(err => {
                         console.error(`[job] fail type=${summary.type} ip=${summary.ip} deliveryTag=${msg.fields.deliveryTag} -> ack(drop)`);
                         console.error(err);
@@ -665,7 +698,7 @@ const { MongoClient } = require('mongodb');
                         // Auto-retrying a failed ACME order would hammer Let's Encrypt's
                         // rate limit; the user can re-request to enqueue a fresh job.
                         // A worker CRASH (no ack at all) still triggers redelivery.
-                        channel.ack(msg);
+                        safeAck(msg, 'drop');
                     });
                 }, {
                     // Manual ack: a crash before ack redelivers the job (crash-safety),
@@ -810,6 +843,21 @@ const { MongoClient } = require('mongodb');
     };
     process.on('SIGINT', () => shutdown('SIGINT'));
     process.on('SIGTERM', () => shutdown('SIGTERM'));
+
+    // Last-resort backstop: this worker runs unattended with no supervisor, so
+    // staying alive beats dying cleanly. Log loudly and keep going — the known
+    // failure modes (connection/channel death) recover via their own handlers
+    // above, which set running=false for the reconnect guard. Deliberately do
+    // NOT touch `running` here: if the connection is actually healthy, forcing
+    // a reconnect would stack a second consumer and round-robin-steal jobs.
+    process.on('uncaughtException', (err) => {
+        console.error('uncaughtException (worker staying up)');
+        console.error(err);
+    });
+    process.on('unhandledRejection', (err) => {
+        console.error('unhandledRejection (worker staying up)');
+        console.error(err);
+    });
 
     // Eagerly spawn + warm the model server at boot (not lazily on the first
     // job), so the model is loaded and the generation path is compiled before

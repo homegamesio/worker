@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>io.homegames.worker</string>
+
+    <!-- EDIT: absolute path to this repo on the worker machine. local.env is
+         sourced relative to this directory. -->
+    <key>WorkingDirectory</key>
+    <string>/Users/josephgarcia/homegames/worker</string>
+
+    <!-- caffeinate -s keeps the machine from sleeping while the worker runs
+         (applies on AC power, which a Mac Studio always is), so no pmset
+         changes are needed. bash -c sources local.env so the worker gets its
+         env vars. EDIT the node path to whatever `which node` prints on the
+         worker machine (launchd's PATH is minimal and won't find nvm/brew
+         installs on its own). -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/bin/caffeinate</string>
+        <string>-s</string>
+        <string>/bin/bash</string>
+        <string>-c</string>
+        <string>set -a; source ./local.env; set +a; exec /opt/homebrew/bin/node index.js</string>
+    </array>
+
+    <key>RunAtLoad</key>
+    <true/>
+    <!-- Restart whenever the process exits, however it died. -->
+    <key>KeepAlive</key>
+    <true/>
+    <!-- Minimum seconds between restarts, so a boot-time crash (e.g. broker
+         unreachable) doesn't hot-loop. -->
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+
+    <!-- EDIT to taste. launchd appends forever and does not rotate these. -->
+    <key>StandardOutPath</key>
+    <string>/Users/josephgarcia/homegames/worker/worker.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/josephgarcia/homegames/worker/worker.err.log</string>
+</dict>
+</plist>

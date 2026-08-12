@@ -249,11 +249,23 @@ def process_job(job: dict) -> dict:
     mode = job.get("mode")
     log(f"Processing {job.get('id')} (mode={mode or 'EDIT'}): {user_prompt[:80]!r}")
 
+    # Total budget for this job, retries included. Kept under Node's 10-minute
+    # backstop so a slow attempt + retries fails HERE (FAILED still posted to
+    # the API) instead of Node SIGKILLing the warm model server mid-request.
+    # Previously each attempt got the full REQUEST_TIMEOUT_SECONDS, so worst
+    # case (3 x 900s) sailed past the backstop and lost the warm model.
+    deadline = time.monotonic() + config.JOB_DEADLINE_SECONDS
     prev_attempt = None
     last_error = None
     for attempt in range(config.MAX_RETRIES + 1):
+        remaining = deadline - time.monotonic()
+        if remaining < 30:
+            last_error = last_error or "job deadline exhausted"
+            log(f"  -> only {remaining:.0f}s left of {config.JOB_DEADLINE_SECONDS}s job deadline; giving up")
+            break
         try:
-            raw = run_model(source, user_prompt, prev_attempt, mode=mode)
+            raw = run_model(source, user_prompt, prev_attempt, mode=mode,
+                            timeout=min(config.REQUEST_TIMEOUT_SECONDS, remaining))
         except Exception as e:  # noqa: BLE001 - report any failure back to the user
             last_error = str(e)[:500]
             log(f"  -> generation error: {last_error}")

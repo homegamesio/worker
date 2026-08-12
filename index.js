@@ -34,10 +34,11 @@ const { MongoClient } = require('mongodb');
     const HEARTBEAT_SECONDS = 30;
     
     // This worker handles three job types off the unified homegames-jobs
-    // queue: ACME certificate generation, LLM "modify my game" requests
-    // (currently disabled at the API — AI_EDITS_ENABLED — because local models
-    // aren't good/fast enough for full game generation yet), and docs
+    // queue: ACME certificate generation, LLM game creation/editing
+    // ("modify my game", gated at the API by AI_EDITS_ENABLED), and docs
     // questions from the "ask something" box on homegames.io/docs.html.
+    // The two LLM-backed types share one model and one KV-cached prompt
+    // prefix (see llm/prompts.py).
     const CERT_REQUEST = 'CERT_REQUEST';
     const LLM_REQUEST = 'LLM_REQUEST';
     const DOCS_QUESTION = 'DOCS_QUESTION';
@@ -456,111 +457,88 @@ const { MongoClient } = require('mongodb');
         llmChild.stdin.write(JSON.stringify(job) + '\n');
     }));
 
-    // POST the model server's result to the API. result = {id, status, result?, error?}.
+    // POST a model-server result to the API. result = {id, status, result?, error?}.
     // The job is only acked once this resolves, and with prefetch(1) an unacked
     // job blocks all further deliveries — so a fetch with NO timeout against a
     // slow/unreachable API would silently wedge the whole consumer. Bound each
     // attempt and retry a few times (the generated result is expensive to lose),
     // then give up so the consumer can ack-drop and move on.
-    const postLlmResult = (requestId, result, attempt = 1) => {
+    // resultKey: the payload field the API expects the generated text under.
+    const makeResultPoster = (tag, endpoint, resultKey) => {
         const MAX_ATTEMPTS = 3;
-        const payload = { requestId, status: result.status };
-        if (result.result != null) payload.result = result.result;
-        if (result.error != null) payload.error = result.error;
-        return fetch(`${API_URL}/internal/llm-result`, {
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/json',
-                'Authorization': `Bearer ${LLM_WORKER_SECRET}`
-            },
-            body: JSON.stringify(payload),
-            signal: AbortSignal.timeout(30000)
-        }).then((resp) => {
-            if (!resp.ok) {
-                return resp.text().then((text) => {
-                    throw new Error(`/internal/llm-result returned ${resp.status}: ${text.slice(0, 200)}`);
-                });
-            }
-            console.log(`[llm] posted ${result.status} for ${requestId}`);
-        }).catch((err) => {
-            if (attempt < MAX_ATTEMPTS) {
-                console.error(`[llm] post attempt ${attempt}/${MAX_ATTEMPTS} for ${requestId} failed (${err && err.message}); retrying`);
-                return new Promise(r => setTimeout(r, 2000 * attempt))
-                    .then(() => postLlmResult(requestId, result, attempt + 1));
-            }
-            throw err;
-        });
+        const post = (requestId, result, attempt = 1) => {
+            const payload = { requestId, status: result.status };
+            if (result.result != null) payload[resultKey] = result.result;
+            if (result.error != null) payload.error = result.error;
+            return fetch(`${API_URL}${endpoint}`, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'Authorization': `Bearer ${LLM_WORKER_SECRET}`
+                },
+                body: JSON.stringify(payload),
+                signal: AbortSignal.timeout(30000)
+            }).then((resp) => {
+                if (!resp.ok) {
+                    return resp.text().then((text) => {
+                        throw new Error(`${endpoint} returned ${resp.status}: ${text.slice(0, 200)}`);
+                    });
+                }
+                console.log(`[${tag}] posted ${result.status} for ${requestId}`);
+            }).catch((err) => {
+                if (attempt < MAX_ATTEMPTS) {
+                    console.error(`[${tag}] post attempt ${attempt}/${MAX_ATTEMPTS} for ${requestId} failed (${err && err.message}); retrying`);
+                    return new Promise(r => setTimeout(r, 2000 * attempt))
+                        .then(() => post(requestId, result, attempt + 1));
+                }
+                throw err;
+            });
+        };
+        return post;
     };
 
-    const handleLlmRequest = (data) => new Promise((resolve, reject) => {
-        // mode 'CREATE' = write a new game from the starter template (absent = edit)
-        const job = { id: data.requestId, source: data.source, prompt: data.prompt, mode: data.mode };
-        // 10 min backstop: covers a cold child's model load plus generation.
-        withTimeout(runLlmJob(job), 10 * 60 * 1000, 'LLM model server').then(
+    const postLlmResult = makeResultPoster('llm', '/internal/llm-result', 'result');
+    const postDocsAnswer = makeResultPoster('docs', '/internal/docs-answer', 'answer');
+
+    // Both LLM-backed job types run the same choreography: send the job to the
+    // model server under a timeout, post the result; on failure restart the
+    // (possibly wedged) server, post a best-effort FAILED so the requester's
+    // poll resolves instead of spinning until the UI timeout, then reject so
+    // the consumer ack-drops. Only the job shape, timeout, and endpoint vary.
+    const makeLlmJobHandler = ({ tag, buildJob, timeoutMs, post }) => (data) => new Promise((resolve, reject) => {
+        withTimeout(runLlmJob(buildJob(data)), timeoutMs, `LLM model server (${tag})`).then(
             (result) => {
                 // Generation succeeded (server still warm); relay to the API.
-                postLlmResult(data.requestId, result).then(resolve).catch(reject);
+                post(data.requestId, result).then(resolve).catch(reject);
             },
             (err) => {
-                // Generation failed (timeout or child died) — the server may be
-                // wedged, so restart it for the next job, then fail this one.
-                console.error('[llm] generation failed for ' + data.requestId + ': ' + (err && err.message));
+                console.error(`[${tag}] generation failed for ${data.requestId}: ${err && err.message}`);
                 restartModelServer();
-                reject(err);
-            }
-        );
-    });
-
-    // POST a docs-question answer to the API. Same retry/timeout discipline as
-    // postLlmResult, different endpoint and payload shape.
-    const postDocsAnswer = (requestId, result, attempt = 1) => {
-        const MAX_ATTEMPTS = 3;
-        const payload = { requestId, status: result.status };
-        if (result.result != null) payload.answer = result.result;
-        if (result.error != null) payload.error = result.error;
-        return fetch(`${API_URL}/internal/docs-answer`, {
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/json',
-                'Authorization': `Bearer ${LLM_WORKER_SECRET}`
-            },
-            body: JSON.stringify(payload),
-            signal: AbortSignal.timeout(30000)
-        }).then((resp) => {
-            if (!resp.ok) {
-                return resp.text().then((text) => {
-                    throw new Error(`/internal/docs-answer returned ${resp.status}: ${text.slice(0, 200)}`);
-                });
-            }
-            console.log(`[docs] posted ${result.status} for ${requestId}`);
-        }).catch((err) => {
-            if (attempt < MAX_ATTEMPTS) {
-                console.error(`[docs] post attempt ${attempt}/${MAX_ATTEMPTS} for ${requestId} failed (${err && err.message}); retrying`);
-                return new Promise(r => setTimeout(r, 2000 * attempt))
-                    .then(() => postDocsAnswer(requestId, result, attempt + 1));
-            }
-            throw err;
-        });
-    };
-
-    const handleDocsQuestion = (data) => new Promise((resolve, reject) => {
-        const job = { id: data.requestId, kind: 'docs', prompt: data.question };
-        // Docs answers are short; a user is actively waiting on the page, so
-        // fail fast relative to game generation. 5 min covers a cold model load.
-        withTimeout(runLlmJob(job), 5 * 60 * 1000, 'LLM model server (docs)').then(
-            (result) => {
-                postDocsAnswer(data.requestId, result).then(resolve).catch(reject);
-            },
-            (err) => {
-                console.error('[docs] answer failed for ' + data.requestId + ': ' + (err && err.message));
-                restartModelServer();
-                // Best-effort FAILED post so the asker's poll resolves instead
-                // of spinning until the UI timeout.
-                postDocsAnswer(data.requestId, { status: 'FAILED', error: 'generation failed' })
+                post(data.requestId, { status: 'FAILED', error: 'generation failed' })
                     .catch(() => {})
                     .finally(() => reject(err));
             }
         );
+    });
+
+    const handleLlmRequest = makeLlmJobHandler({
+        tag: 'llm',
+        // mode 'CREATE' = write a new game from the starter template (absent = edit)
+        buildJob: (data) => ({ id: data.requestId, source: data.source, prompt: data.prompt, mode: data.mode }),
+        // 10 min backstop: covers a cold child's model load plus generation
+        // with retries (the child budgets itself under this via
+        // JOB_DEADLINE_SECONDS, so tripping it means a wedged server).
+        timeoutMs: 10 * 60 * 1000,
+        post: postLlmResult
+    });
+
+    const handleDocsQuestion = makeLlmJobHandler({
+        tag: 'docs',
+        buildJob: (data) => ({ id: data.requestId, kind: 'docs', prompt: data.question }),
+        // Docs answers are short; a user is actively waiting on the page, so
+        // fail fast relative to game generation. 5 min covers a cold model load.
+        timeoutMs: 5 * 60 * 1000,
+        post: postDocsAnswer
     });
 
     const messageHandlers = {
@@ -646,10 +624,10 @@ const { MongoClient } = require('mongodb');
                     }
                 });
                 // One unacked message at a time. Without this the broker pushes the
-                // entire backlog to a single consumer at once; cert jobs run for
-                // minutes, so a connection flap would strand (and later redeliver)
-                // every in-flight job instead of just one.
-//                channel.prefetch(1);
+                // entire backlog to a single consumer at once; cert and game-gen
+                // jobs run for minutes, so a connection flap would strand (and
+                // later redeliver) every in-flight job instead of just one.
+                channel.prefetch(1);
                 console.log('listening to messages on ' + QUEUE_NAME + ' at ' + REQUEST_QUEUE_URL);
                 channel.consume(QUEUE_NAME, (msg) => {
                     console.log('got a damn message');

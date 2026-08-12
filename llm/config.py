@@ -16,12 +16,28 @@ LLM_SERVER_URL = os.environ.get("LLM_SERVER_URL", "http://localhost:1234/v1").rs
 
 # Model name to request, as LM Studio reports it (see GET /v1/models).
 # Leave empty to auto-select the first model the server lists.
+#
+# IMPORTANT: load the model with a context length of at least ~45k tokens.
+# Every request (game gen AND docs) carries the shared ~29k-token system
+# prompt (knowledge doc + authoring guide; see prompts.py), plus the game's
+# source and up to MAX_TOKENS of output. Too small a context 400s at warmup.
 MODEL = os.environ.get("MODEL", "google/gemma-4-26b-a4b")
 
-# Hard deadline for one generation request. A 31B GGUF producing a full game
+# Hard deadline for one generation request. A big model producing a full game
 # can legitimately take several minutes; this only exists so a hung server
 # fails the job instead of wedging the pipeline forever.
 REQUEST_TIMEOUT_SECONDS = int(os.environ.get("REQUEST_TIMEOUT_SECONDS", "900"))
+
+# Total wall-clock budget for one game-generation job INCLUDING validation
+# retries. Must stay comfortably under the Node parent's 10-minute LLM job
+# backstop (index.js): if the child blows past that, Node SIGKILLs the model
+# server and the warm model/KV cache dies with it. Instead the child stops
+# retrying when this budget runs out and reports FAILED, which still gets
+# posted back to the API.
+JOB_DEADLINE_SECONDS = int(os.environ.get("JOB_DEADLINE_SECONDS", "540"))
+
+# Same idea for docs questions, under Node's 5-minute docs backstop.
+DOCS_DEADLINE_SECONDS = int(os.environ.get("DOCS_DEADLINE_SECONDS", "270"))
 
 # --- Generation -------------------------------------------------------------
 MAX_TOKENS = int(os.environ.get("MAX_TOKENS", "8192"))

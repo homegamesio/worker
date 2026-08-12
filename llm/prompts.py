@@ -1,14 +1,53 @@
-"""Prompt assembly and output extraction for the LLM worker."""
+"""Prompt assembly and output extraction for the LLM worker.
+
+Both job types (game generation/editing and docs Q&A) share one large system
+prompt PREFIX -- the platform knowledge doc followed by the squish.js
+authoring guide -- and diverge only in a short task-instruction tail. The
+prefix is byte-identical across job types ON PURPOSE: the LM Studio server
+reuses its KV cache for the longest common prefix of consecutive requests
+(cache_prompt=true in model_server.py), so alternating between job types
+re-prefills only the small tail instead of the ~29k-token document block.
+Don't reorder the documents or interpolate anything job-specific above the
+tail.
+"""
 
 import functools
 import re
+import sys
 
 import config
 
-SYSTEM_INSTRUCTIONS = """\
-You are an expert Homegames game developer. Homegames games are written in \
-JavaScript using the squish.js library. You will be given the current contents \
-of a game's index.js and a message from the game's author.
+SHARED_CONTEXT = """\
+You are the AI assistant inside Homegames' automated job pipeline. Homegames \
+is a free, open-source (GPLv3) platform for making, sharing, and playing \
+simple multiplayer browser games. Games are written in JavaScript using the \
+squish.js library.
+
+Two reference documents follow: the whole-platform knowledge reference, then \
+the authoritative squish.js game authoring guide. Your task instructions come \
+AFTER the documents, under "Your task".
+
+## Homegames platform reference
+
+---
+{knowledge_doc}
+---
+
+## squish.js game authoring guide
+
+Treat this guide as the contract for valid games:
+
+---
+{authoring_doc}
+---
+
+## Your task
+
+"""
+
+GAME_INSTRUCTIONS = """\
+You are an expert Homegames game developer. You will be given the current \
+contents of a game's index.js and a message from the game's author.
 
 You are a code generator inside an automated pipeline, not a chat assistant. \
 Your output is fed directly to a parser that extracts one JavaScript code block \
@@ -34,43 +73,65 @@ Rewrite index.js to satisfy the request. Follow these rules strictly:
 - Output the COMPLETE new index.js, not a diff or a fragment.
 - Preserve everything that the request does not ask you to change.
 - The file must export the game class via `module.exports` and remain valid, \
-runnable squish.js per the authoring guide below.
+runnable squish.js per the authoring guide above.
 - Do not add explanations, greetings, or questions. Output ONLY the code, in a \
 single ```javascript code block. Your first line of output must be the opening \
 fence.
+"""
 
-Below is the authoritative squish.js authoring guide. Treat it as the contract \
-for valid games:
+DOCS_INSTRUCTIONS = """\
+You are the Homegames docs assistant, answering questions from visitors to \
+homegames.io's documentation page.
 
----
-{authoring_doc}
----
+Rules:
+- Answer using ONLY the reference documents above. If they don't cover the \
+question, say you're not sure and suggest the docs page \
+(homegames.io/docs.html) or emailing joseph@homegames.io.
+- Keep answers short: a few sentences, or a short list. Include a small code \
+snippet only when it directly answers the question.
+- You answer questions — you do NOT write games. If asked to write a complete \
+game or a large amount of code, explain that you can't generate games here, \
+and point to the Studio's templates and the docs instead.
+- If the question is not about Homegames or making Homegames games, say you \
+can only help with Homegames.
+- Plain text or simple markdown only. No greetings or sign-offs.
 """
 
 
-@functools.lru_cache(maxsize=1)
-def _authoring_doc() -> str:
+@functools.lru_cache(maxsize=None)
+def _read_doc(path: str, label: str) -> str:
     try:
-        with open(config.AUTHORING_DOC_PATH, "r", encoding="utf-8") as f:
+        with open(path, "r", encoding="utf-8") as f:
             return f.read()
     except OSError:
+        # stderr, NOT stdout: stdout is the JSON protocol channel to the Node
+        # parent, and a stray warning line there corrupts the protocol stream.
         print(
-            f"WARNING: authoring guide not found at {config.AUTHORING_DOC_PATH}; "
-            "proceeding without it.",
+            f"WARNING: {label} not found at {path}; proceeding without it.",
+            file=sys.stderr,
             flush=True,
         )
-        return "(authoring guide unavailable)"
+        return f"({label} unavailable)"
 
 
-def system_prompt() -> str:
-    """The static system prompt. Identical every request, so it can be cached."""
-    return SYSTEM_INSTRUCTIONS.format(authoring_doc=_authoring_doc())
+@functools.lru_cache(maxsize=None)
+def system_prompt(kind: str = "game") -> str:
+    """
+    Full system prompt for one job kind ("game" or "docs"). Static per kind,
+    and identical across kinds up to the task-instruction tail, so the model
+    server's KV cache covers the shared document prefix for both.
+    """
+    prefix = SHARED_CONTEXT.format(
+        knowledge_doc=_read_doc(config.KNOWLEDGE_DOC_PATH, "knowledge doc"),
+        authoring_doc=_read_doc(config.AUTHORING_DOC_PATH, "authoring guide"),
+    )
+    return prefix + (DOCS_INSTRUCTIONS if kind == "docs" else GAME_INSTRUCTIONS)
 
 
 def build_messages(source: str, user_prompt: str, prev_attempt: dict = None, mode: str = None) -> list[dict]:
     """
-    Build the chat messages for the model. The system message is constant
-    (see system_prompt) so the worker can cache its KV state.
+    Build the chat messages for a game-generation job. The system message is
+    constant (see system_prompt) so the server can reuse its KV cache.
 
     prev_attempt, when given, is {"code": str, "error": str} from a failed
     validation pass, fed back so the model can correct itself.
@@ -112,60 +173,15 @@ def build_messages(source: str, user_prompt: str, prev_attempt: dict = None, mod
             "single ```javascript code block, with no other text."
         )
     return [
-        {"role": "system", "content": system_prompt()},
+        {"role": "system", "content": system_prompt("game")},
         {"role": "user", "content": user},
     ]
-
-
-DOCS_SYSTEM_INSTRUCTIONS = """\
-You are the Homegames docs assistant, answering questions from visitors to \
-homegames.io's documentation page. Homegames is a free, open-source (GPLv3) \
-platform for making, sharing, and playing simple multiplayer browser games.
-
-Rules:
-- Answer using ONLY the reference document below. If the reference doesn't \
-cover the question, say you're not sure and suggest the docs page \
-(homegames.io/docs.html) or emailing joseph@homegames.io.
-- Keep answers short: a few sentences, or a short list. Include a small code \
-snippet only when it directly answers the question.
-- You answer questions — you do NOT write games. If asked to write a complete \
-game or a large amount of code, explain that you can't generate games, and \
-point to the Studio's templates and the docs instead.
-- If the question is not about Homegames or making Homegames games, say you \
-can only help with Homegames.
-- Plain text or simple markdown only. No greetings or sign-offs.
-
-Reference document:
-
----
-{knowledge_doc}
----
-"""
-
-
-@functools.lru_cache(maxsize=1)
-def _knowledge_doc() -> str:
-    try:
-        with open(config.KNOWLEDGE_DOC_PATH, "r", encoding="utf-8") as f:
-            return f.read()
-    except OSError:
-        print(
-            f"WARNING: knowledge doc not found at {config.KNOWLEDGE_DOC_PATH}; "
-            "proceeding without it.",
-            flush=True,
-        )
-        return "(knowledge doc unavailable)"
-
-
-def docs_system_prompt() -> str:
-    """Static system prompt for docs Q&A. Identical every request (KV-cacheable)."""
-    return DOCS_SYSTEM_INSTRUCTIONS.format(knowledge_doc=_knowledge_doc())
 
 
 def build_docs_messages(question: str) -> list[dict]:
     """Chat messages for one docs question."""
     return [
-        {"role": "system", "content": docs_system_prompt()},
+        {"role": "system", "content": system_prompt("docs")},
         {"role": "user", "content": question},
     ]
 

@@ -104,11 +104,12 @@ def wait_for_server():
             delay = min(delay * 2, 30)
 
 
-def run_model(source: str, user_prompt: str, prev_attempt: dict = None, max_tokens=None, mode: str = None, messages: list = None) -> str:
+def run_model(source: str, user_prompt: str, prev_attempt: dict = None, max_tokens=None, mode: str = None, messages: list = None, timeout: float = None) -> str:
     """Send one chat completion to LM Studio and return the raw generated text.
 
     Callers either let this build the game-edit messages (default) or pass
-    prebuilt `messages` (docs Q&A path).
+    prebuilt `messages` (docs Q&A path). `timeout` bounds this one HTTP
+    request; defaults to REQUEST_TIMEOUT_SECONDS.
     """
     if messages is None:
         messages = build_messages(source, user_prompt, prev_attempt, mode)
@@ -118,13 +119,15 @@ def run_model(source: str, user_prompt: str, prev_attempt: dict = None, max_toke
         "max_tokens": max_tokens or config.MAX_TOKENS,
         "temperature": config.TEMPERATURE,
         "stream": False,
-        # llama.cpp-style hint to reuse the KV cache for the shared prefix
-        # (our ~25k-token system prompt is identical every request). Servers
-        # that don't know the field ignore it.
+        # llama.cpp-style hint to reuse the KV cache for the shared prefix.
+        # The ~29k-token document block at the top of the system prompt is
+        # byte-identical across BOTH job types (see prompts.py), so game jobs
+        # and docs questions reuse each other's prefill. Servers that don't
+        # know the field ignore it.
         "cache_prompt": True,
     }
     start = time.monotonic()
-    resp = _http_json("/chat/completions", payload, timeout=config.REQUEST_TIMEOUT_SECONDS)
+    resp = _http_json("/chat/completions", payload, timeout=int(timeout or config.REQUEST_TIMEOUT_SECONDS))
     choices = resp.get("choices") or []
     if not choices:
         raise RuntimeError(f"LM Studio returned no choices: {json.dumps(resp)[:300]}")
@@ -142,21 +145,24 @@ def run_model(source: str, user_prompt: str, prev_attempt: dict = None, max_toke
 def _warmup():
     """
     Run a tiny end-to-end generation before announcing readiness. LM Studio
-    JIT-loads a model on its first request, which can take minutes for a 31B —
-    paying that here means the first real job doesn't. Best effort: a warmup
-    failure must not stop the server from serving.
+    JIT-loads a model on its first request, which can take minutes for a big
+    model — paying that here means the first real job doesn't. Best effort: a
+    warmup failure must not stop the server from serving.
 
-    Warms the DOCS prompt: it's the only live path (game edits are disabled at
-    the API), it primes the exact KV prefix real questions reuse, and at ~4-5k
-    tokens it fits a model loaded with a small (8k) context — the game-edit
-    prompt embeds the full authoring guide (~25k tokens) and would 400 there.
+    Uses the docs messages, but since both job types share the same ~29k-token
+    system-prompt prefix (see prompts.py), this one request prefills the KV
+    prefix that game jobs AND docs questions both reuse.
     """
     try:
-        log("warming up (may trigger LM Studio's model load)...")
+        log("warming up (may trigger LM Studio's model load; prefills the shared prompt prefix)...")
         run_model("", "", messages=build_docs_messages("noop"), max_tokens=4)
         log("warmup complete.")
     except Exception as e:  # noqa: BLE001
-        log(f"WARNING: warmup failed ({e}); first request will be slower")
+        log(
+            f"WARNING: warmup failed ({e}); first request will be slower. "
+            "If this is a context-length 400, reload the model in LM Studio "
+            "with a context length of at least ~45k tokens."
+        )
 
 
 def validate_js(code: str) -> str | None:
@@ -210,6 +216,9 @@ def process_docs_job(job: dict) -> dict:
             "", "",
             messages=build_docs_messages(question),
             max_tokens=config.DOCS_MAX_TOKENS,
+            # Fail here, under Node's 5-minute docs backstop, so the failure
+            # is reported cleanly instead of Node killing the warm server.
+            timeout=min(config.REQUEST_TIMEOUT_SECONDS, config.DOCS_DEADLINE_SECONDS),
         )
     except Exception as e:  # noqa: BLE001 - report any failure back
         err = str(e)[:500]

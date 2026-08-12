@@ -7,6 +7,14 @@ const { MongoClient } = require('mongodb');
     const path = require('path');
     const { spawn } = require('child_process');
 
+    // Prefix every log line with an ISO timestamp. This worker runs unattended
+    // (launchd), so log output without timestamps is impossible to correlate
+    // with anything.
+    for (const level of ['log', 'warn', 'error']) {
+        const orig = console[level].bind(console);
+        console[level] = (...args) => orig(new Date().toISOString(), ...args);
+    }
+
     // acme-client shares one axios instance with no default timeout, so a hung
     // TCP connection to Let's Encrypt never settles and client.auto() waits
     // forever (the cert job stalls right after logging the CSR). Give every ACME
@@ -91,8 +99,8 @@ const { MongoClient } = require('mongodb');
     
     const getMongoClient = () => {
         const uri = DB_USERNAME ? `mongodb://${DB_USERNAME}:${DB_PASSWORD}@${DB_HOST}:${DB_PORT}/${DB_NAME}` : `mongodb://${DB_HOST}:${DB_PORT}/${DB_NAME}`;
-        console.log("URI");
-        console.log(uri);
+        // Log host/db only — the full URI contains the password.
+        console.log(`[db] connecting to mongodb://${DB_HOST}:${DB_PORT}/${DB_NAME}`);
         const params = {};
         if (DB_USERNAME) {
             params.auth = {
@@ -117,15 +125,16 @@ const { MongoClient } = require('mongodb');
     
     const challengeCreateFn = async(authz, challenge, keyAuthorization) => {
         if (challenge.type === 'dns-01') {
-            console.log('creating!!');
+            console.log(`[cert] creating dns-01 TXT record _acme-challenge.${authz.identifier.value}`);
             await createDnsRecord(`_acme-challenge.${authz.identifier.value}`, keyAuthorization);
+            console.log(`[cert] TXT record created and INSYNC`);
         }
     };
-    
+
     const challengeRemoveFn = async(authz, challenge, keyAuthorization) => {
-    
+
         if (challenge.type === 'dns-01') {
-            console.log('removing!!');
+            console.log(`[cert] removing dns-01 TXT record _acme-challenge.${authz.identifier.value}`);
             await deleteDnsRecord(`_acme-challenge.${authz.identifier.value}`);
         }
     };
@@ -202,9 +211,9 @@ const { MongoClient } = require('mongodb');
             const aws = require('aws-sdk');
             const route53 = new aws.Route53();
             route53.changeResourceRecordSets(deleteDnsParams, (err, data) => {
-                console.log(err);
-                console.log(data);
                 if (err) {
+                    console.error(`[cert] route53 DELETE failed for ${name}`);
+                    console.error(err);
                     reject(err);
                     return;
                 }
@@ -224,11 +233,11 @@ const { MongoClient } = require('mongodb');
 
             });
         }).catch(err => {
-            console.error('Error');
+            console.error(`[cert] failed to look up TXT record ${name} for deletion`);
             console.error(err);
             reject(err);
         });
-    
+
     });
     
     const getDnsRecord = (name) => new Promise((resolve, reject) => {
@@ -265,7 +274,7 @@ const { MongoClient } = require('mongodb');
                 expiresAt: Date.now() + (60 * 24 * 60 * 60 * 1000), // 60 days from now
                 cert
             }).then(() => {
-                console.log('auyoao');
+                console.log(`[cert] stored cert for ip=${ip} in mongo`);
                 // Must settle the promise: handleCertRequest chains .then(resolve)
                 // on this, so without it a SUCCESSFUL issuance never acks and the
                 // job gets redelivered.
@@ -285,13 +294,14 @@ const { MongoClient } = require('mongodb');
     });
 
     const handleCertRequest = (data) => new Promise((resolve, reject) => {
-        console.log('yoooo');
-        console.log(data);
+        // Never log `data` itself: it carries the ACME account private key
+        // and the CSR.
+        console.log(`[cert] request for ip=${data.ip}`);
 
         getValidCert(data.ip).then((existing) => {
             if (existing) {
                 // Already have a live cert for this IP — don't re-issue.
-                console.log(`[job] cert already valid for ip=${data.ip} (expiresAt=${existing.expiresAt}) -> skipping issuance`);
+                console.log(`[cert] already valid for ip=${data.ip} (expiresAt=${existing.expiresAt}) -> skipping issuance`);
                 resolve();
                 return;
             }
@@ -302,9 +312,8 @@ const { MongoClient } = require('mongodb');
                 accountKey: key
             });
 
-            console.log('did this !!');
+            console.log(`[cert] starting ACME order (dns-01) for ip=${data.ip}`);
             const csr = data.cert.data;
-            console.log('this is csr ' + csr);
             const autoOpts = {
                 csr,
                 email: 'joseph@homegames.io',
@@ -317,13 +326,12 @@ const { MongoClient } = require('mongodb');
             // 5 min backstop: dns-01 propagation + LE validation can legitimately take
             // a couple minutes, but anything past this is a stuck flow, not slow DNS.
             withTimeout(client.auto(autoOpts), 5 * 60 * 1000, 'ACME client.auto').then(certificate => {
-                console.log('certificate!');
-                console.log(certificate);
+                console.log(`[cert] issued certificate for ip=${data.ip} (${certificate.length} bytes)`);
                 // Reject if the store fails, so a freshly-issued (rate-limited!) cert
                 // that can't be persisted surfaces as a failure instead of hanging.
                 insertCertRecord(data.ip, Buffer.from(certificate).toString('base64')).then(resolve).catch(reject);
             }).catch(err => {
-                console.error('error creating certificate');
+                console.error(`[cert] issuance failed for ip=${data.ip}`);
                 console.error(err);
                 // Propagate so the consumer can ack-and-drop instead of hanging silently.
                 reject(err);
@@ -353,7 +361,6 @@ const { MongoClient } = require('mongodb');
     };
 
     const handleLlmLine = (line) => {
-        console.log('what the fuck!');
         let msg;
         try {
             msg = JSON.parse(line);
@@ -400,10 +407,13 @@ const { MongoClient } = require('mongodb');
             }
         });
 
-        // stderr is the child's human-readable logging; surface it tagged.
+        // stderr is the child's human-readable logging; surface it tagged and
+        // per-line so each line gets the timestamp prefix.
         child.stderr.setEncoding('utf8');
         child.stderr.on('data', (chunk) => {
-            process.stderr.write('[llm] ' + chunk);
+            for (const line of chunk.split('\n')) {
+                if (line.trim()) console.error('[llm] ' + line);
+            }
         });
 
         const onGone = (info) => {
@@ -554,8 +564,6 @@ const { MongoClient } = require('mongodb');
     };
     
     const handleMessage = (message) => new Promise((resolve, reject) => {
-        console.log('hi jsdnsd');
-        console.log(message);
         let data = null;
         try {
             data = JSON.parse(message.content);
@@ -587,14 +595,14 @@ const { MongoClient } = require('mongodb');
                 // whole process — which is exactly what was killing the worker
                 // after an ECONNRESET. Log it; the paired 'close' below recycles.
                 channel.on('error', (err) => {
-                    console.error('channel error');
+                    console.error('[amqp] channel error');
                     console.error(err);
                 });
                 // A dead channel on a live connection consumes nothing forever.
                 // Tear the connection down so the setInterval guard rebuilds
                 // exactly one fresh connection + consumer.
                 channel.on('close', () => {
-                    console.warn('channel closed -> recycling connection');
+                    console.warn('[amqp] channel closed -> recycling connection');
                     try { connection.close(); } catch (e) { /* already closing */ }
                     running = false;
                 });
@@ -628,15 +636,13 @@ const { MongoClient } = require('mongodb');
                 // jobs run for minutes, so a connection flap would strand (and
                 // later redeliver) every in-flight job instead of just one.
                 channel.prefetch(1);
-                console.log('listening to messages on ' + QUEUE_NAME + ' at ' + REQUEST_QUEUE_URL);
+                console.log('[amqp] consuming ' + QUEUE_NAME + ' at ' + REQUEST_QUEUE_URL);
                 channel.consume(QUEUE_NAME, (msg) => {
-                    console.log('got a damn message');
-                    console.log(msg);
                     // null msg means the consumer was cancelled by the broker
                     // (queue deleted, node failover). The connection is still
                     // "up" but delivers nothing — recycle it so we re-consume.
                     if (!msg) {
-                        console.warn('consumer cancelled by broker -> recycling connection');
+                        console.warn('[amqp] consumer cancelled by broker -> recycling connection');
                         try { connection.close(); } catch (e) { /* already closing */ }
                         running = false;
                         return;
@@ -659,18 +665,38 @@ const { MongoClient } = require('mongodb');
                     let summary = {};
                     try {
                         const parsed = JSON.parse(msg.content);
-                        summary = { type: parsed.type, ip: parsed.ip };
+                        summary = { type: parsed.type, ip: parsed.ip, requestId: parsed.requestId };
+                        // The human-readable request: the author's prompt (LLM
+                        // jobs) or the visitor's question (docs jobs). Clamped
+                        // so a pathological submission can't flood the log.
+                        const text = parsed.prompt || parsed.question;
+                        if (text != null) {
+                            const s = String(text);
+                            summary.text = s.length > 500 ? s.slice(0, 500) + `… [${s.length} chars total]` : s;
+                        }
+                        if (parsed.mode) summary.mode = parsed.mode;
+                        if (parsed.source != null) summary.sourceBytes = Buffer.byteLength(String(parsed.source));
                     } catch (e) { /* parse error surfaced by handleMessage below */ }
-                    console.log(`[job] recv type=${summary.type} ip=${summary.ip} redelivered=${msg.fields.redelivered} deliveryTag=${msg.fields.deliveryTag} consumerTag=${msg.fields.consumerTag} messageId=${msg.properties.messageId}`);
+                    const idPart = (summary.ip ? ` ip=${summary.ip}` : '') + (summary.requestId ? ` requestId=${summary.requestId}` : '');
+                    console.log(`[job] recv type=${summary.type}${idPart}` +
+                        (summary.mode ? ` mode=${summary.mode}` : '') +
+                        (summary.sourceBytes != null ? ` sourceBytes=${summary.sourceBytes}` : '') +
+                        ` redelivered=${msg.fields.redelivered} deliveryTag=${msg.fields.deliveryTag} consumerTag=${msg.fields.consumerTag} messageId=${msg.properties.messageId}`);
+                    if (summary.text != null) {
+                        // JSON.stringify keeps it on one line (escapes newlines).
+                        console.log(`[job] request text: ${JSON.stringify(summary.text)}`);
+                    }
 
+                    const startedAt = Date.now();
+                    const elapsed = () => ((Date.now() - startedAt) / 1000).toFixed(1) + 's';
                     handleMessage(msg).then(() => {
-                        console.log(`[job] done type=${summary.type} ip=${summary.ip} deliveryTag=${msg.fields.deliveryTag} -> ack`);
+                        console.log(`[job] done type=${summary.type}${idPart} deliveryTag=${msg.fields.deliveryTag} in ${elapsed()} -> ack`);
                         // Ack on success so it's removed from the queue. If the
                         // channel that delivered this msg has since closed
                         // (reconnect), the broker redelivers it instead.
                         safeAck(msg, 'success');
                     }).catch(err => {
-                        console.error(`[job] fail type=${summary.type} ip=${summary.ip} deliveryTag=${msg.fields.deliveryTag} -> ack(drop)`);
+                        console.error(`[job] fail type=${summary.type}${idPart} deliveryTag=${msg.fields.deliveryTag} in ${elapsed()} -> ack(drop)`);
                         console.error(err);
                         // Application-level failure: ack to DROP (do NOT requeue).
                         // Auto-retrying a failed ACME order would hammer Let's Encrypt's
@@ -752,7 +778,7 @@ const { MongoClient } = require('mongodb');
     });
 
     const run = () => new Promise((resolve, reject) => {
-        console.log("RIRIRI" + REQUEST_QUEUE_URL);
+        console.log('[amqp] connecting to ' + REQUEST_QUEUE_URL);
         amqp.connect(REQUEST_QUEUE_URL, { 'heartbeat': HEARTBEAT_SECONDS }, (connectionError, connection) => {
             if (connectionError) {
                 // Let the setInterval guard retry; don't reconnect inline.
@@ -766,13 +792,13 @@ const { MongoClient } = require('mongodb');
             // stacks overlapping consumers. Instead just release the guard: the
             // setInterval below restarts exactly ONE connection on its next tick.
             connection.on('error', (err) => {
-                console.error("queue error");
+                console.error('[amqp] connection error');
                 console.error(err);
                 running = false;
             });
 
             connection.on('close', () => {
-                console.warn('queue connection closed');
+                console.warn('[amqp] connection closed');
                 running = false;
             });
 

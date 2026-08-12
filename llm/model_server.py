@@ -210,7 +210,7 @@ def process_docs_job(job: dict) -> dict:
     validation, no retries — just a short grounded answer.
     """
     question = job.get("prompt", "")
-    log(f"Processing docs question {job.get('id')}: {question[:80]!r}")
+    log(f"Processing docs question {job.get('id')}: {question[:300]!r}")
     try:
         raw = run_model(
             "", "",
@@ -228,7 +228,7 @@ def process_docs_job(job: dict) -> dict:
     answer = raw.strip()
     if not answer:
         return {"status": "FAILED", "error": "Model returned empty answer"}
-    log(f"  -> answered ({len(answer)} chars)")
+    log(f"  -> answered ({len(answer)} chars): {answer[:300]!r}")
     return {"status": "COMPLETED", "result": answer}
 
 
@@ -247,7 +247,7 @@ def process_job(job: dict) -> dict:
     source = job.get("source", "")
     user_prompt = job.get("prompt", "")
     mode = job.get("mode")
-    log(f"Processing {job.get('id')} (mode={mode or 'EDIT'}): {user_prompt[:80]!r}")
+    log(f"Processing {job.get('id')} (mode={mode or 'EDIT'}, source={len(source)} chars): {user_prompt[:300]!r}")
 
     # Total budget for this job, retries included. Kept under Node's 10-minute
     # backstop so a slow attempt + retries fails HERE (FAILED still posted to
@@ -272,9 +272,10 @@ def process_job(job: dict) -> dict:
             break
 
         code = extract_code(raw)
+        log(f"  -> attempt {attempt + 1}: model returned {len(raw)} chars, extracted {len(code)} chars of code")
         err = validate_js(code)
         if err is None:
-            log(f"  -> success on attempt {attempt + 1} ({len(code)} chars)")
+            log(f"  -> success on attempt {attempt + 1} ({len(code)} chars): {code[:200]!r}")
             return {"status": "COMPLETED", "result": code}
 
         last_error = err
